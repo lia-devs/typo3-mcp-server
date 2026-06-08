@@ -17,10 +17,18 @@ use TYPO3\CMS\Core\Utility\GeneralUtility;
  */
 class OAuthAuthorizeEndpoint
 {
+    use CorsHeadersTrait;
     use RequestUrlTrait;
 
     public function __invoke(ServerRequestInterface $request): ResponseInterface
     {
+        // Handle preflight OPTIONS request before any auth logic so cross-origin
+        // clients (e.g. MCP Inspector) do not receive a login redirect, which the
+        // browser rejects as "Redirect is not allowed for a preflight request".
+        if ($request->getMethod() === 'OPTIONS') {
+            return $this->handlePreflightRequest($request);
+        }
+
         try {
             $queryParams = $request->getQueryParams();
             $postParams = $request->getParsedBody() ?: [];
