@@ -516,85 +516,112 @@ class OAuthAuthorizeEndpoint
     }
 
 
-    private function generateConsentTemplate(array $data): string
-    {
-        return '<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Authorize MCP Access</title>
-    <style>
+    /**
+     * One palette and one component set for all three OAuth screens.
+     *
+     * They used to carry a copy of the CSS each, which is how the consent form and the
+     * code page drifted into slightly different cards. The light values are deliberately
+     * the ones that were already there — this unifies and adds a dark scheme, it is not a
+     * redesign of a screen editors already recognise.
+     *
+     * Every colour is a token defined on a bare :root and redefined under
+     * prefers-color-scheme: dark. A value defined only inside the media query would leave
+     * light mode unstyled, and vice versa.
+     */
+    private const PAGE_STYLES = '
+        :root {
+            color-scheme: light dark;
+            --bg: #f5f5f5;
+            --card: #ffffff;
+            --border: #dddddd;
+            --text: #333333;
+            --muted: #666666;
+            --subtle-bg: #f8f9fa;
+            --accent: #007cba;
+            --accent-hover: #005a87;
+            --on-accent: #ffffff;
+            --neutral: #666666;
+            --neutral-hover: #333333;
+            --on-neutral: #ffffff;
+            --success: #28a745;
+            --shadow: rgba(0, 0, 0, 0.1);
+        }
+        @media (prefers-color-scheme: dark) {
+            :root {
+                --bg: #16181c;
+                --card: #1e2126;
+                --border: #2e333a;
+                --text: #e8eaed;
+                --muted: #a3abb6;
+                --subtle-bg: #262a30;
+                --accent: #3ba3dd;
+                --accent-hover: #5cb8ea;
+                --on-accent: #0b1a24;
+                --neutral: #454c54;
+                --neutral-hover: #566068;
+                --on-neutral: #e8eaed;
+                --success: #5cc98e;
+                --shadow: rgba(0, 0, 0, 0.5);
+            }
+        }
+        * { box-sizing: border-box; }
         body {
             font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
             margin: 0;
             padding: 40px 20px;
-            background-color: #f5f5f5;
+            background-color: var(--bg);
+            color: var(--text);
         }
         .container {
             max-width: 500px;
             margin: 0 auto;
-            background: white;
+            background: var(--card);
             padding: 40px;
             border-radius: 8px;
-            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+            box-shadow: 0 2px 10px var(--shadow);
         }
-        .header {
-            text-align: center;
-            margin-bottom: 30px;
+        .container.centered { text-align: center; }
+        .header { text-align: center; margin-bottom: 30px; }
+        h1 { color: var(--text); margin: 0 0 10px 0; font-size: 24px; }
+        p { margin: 0; color: var(--muted); }
+        strong { color: var(--text); }
+        .target {
+            margin-bottom: 20px;
+            padding: 16px 20px;
+            border: 1px solid var(--border);
+            border-left: 4px solid var(--accent);
+            border-radius: 4px;
         }
-        .header h1 {
-            color: #333;
-            margin: 0 0 10px 0;
-            font-size: 24px;
+        .target-name { font-weight: 600; color: var(--text); }
+        .target-host {
+            margin-top: 4px;
+            font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+            font-size: 13px;
+            color: var(--muted);
+            word-break: break-all;
         }
         .info {
-            background: #f8f9fa;
+            background: var(--subtle-bg);
             padding: 20px;
             border-radius: 4px;
             margin-bottom: 30px;
         }
-        .info p {
-            margin: 0;
-            color: #666;
-        }
-        .permissions {
-            margin-bottom: 30px;
-        }
-        .permissions h3 {
-            color: #333;
-            margin: 0 0 15px 0;
-        }
-        .permissions ul {
-            margin: 0;
-            padding-left: 20px;
-        }
-        .permissions li {
-            margin-bottom: 8px;
-            color: #666;
-        }
-        .form-group {
-            margin-bottom: 20px;
-        }
-        label {
-            display: block;
-            margin-bottom: 5px;
-            font-weight: 500;
-            color: #333;
-        }
+        .permissions { margin-bottom: 30px; }
+        .permissions h3 { color: var(--text); margin: 0 0 15px 0; }
+        .permissions ul { margin: 0; padding-left: 20px; }
+        .permissions li { margin-bottom: 8px; color: var(--muted); }
+        .form-group { margin-bottom: 20px; }
+        label { display: block; margin-bottom: 5px; font-weight: 500; color: var(--text); }
         input[type="text"] {
             width: 100%;
             padding: 10px;
-            border: 1px solid #ddd;
+            border: 1px solid var(--border);
             border-radius: 4px;
             font-size: 14px;
-            box-sizing: border-box;
+            background: var(--card);
+            color: var(--text);
         }
-        .buttons {
-            display: flex;
-            gap: 10px;
-            justify-content: center;
-        }
+        .buttons { display: flex; gap: 10px; justify-content: center; }
         button {
             padding: 12px 24px;
             border: none;
@@ -603,43 +630,73 @@ class OAuthAuthorizeEndpoint
             cursor: pointer;
             font-weight: 500;
         }
-        .approve {
-            background: #007cba;
-            color: white;
-        }
-        .approve:hover {
-            background: #005a87;
-        }
-        .deny {
-            background: #666;
-            color: white;
-        }
-        .deny:hover {
-            background: #333;
-        }
-        .target {
-            margin-bottom: 20px;
-            padding: 16px 20px;
-            border: 1px solid #ddd;
-            border-left: 4px solid #007cba;
+        .approve { background: var(--accent); color: var(--on-accent); }
+        .approve:hover { background: var(--accent-hover); }
+        .deny { background: var(--neutral); color: var(--on-neutral); }
+        .deny:hover { background: var(--neutral-hover); }
+        .success { color: var(--success); font-size: 24px; margin-bottom: 20px; }
+        .code {
+            background: var(--subtle-bg);
+            padding: 20px;
             border-radius: 4px;
+            font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+            font-size: 16px;
+            word-break: break-all;
+            margin: 20px 0;
+            border: 2px solid var(--accent);
+            color: var(--text);
         }
-        .target-name {
-            font-weight: 600;
-            color: #333;
+        .copy-button {
+            background: var(--accent);
+            color: var(--on-accent);
+            padding: 10px 20px;
+            margin-top: 10px;
         }
-        .target-host {
-            margin-top: 4px;
+        .copy-button:hover { background: var(--accent-hover); }
+        .instructions { color: var(--muted); margin-top: 20px; }
+        .errorcode {
+            margin-top: 16px;
+            display: inline-block;
+            padding: 6px 10px;
+            border-radius: 4px;
+            background: var(--subtle-bg);
             font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
             font-size: 13px;
-            color: #666;
+            color: var(--text);
             word-break: break-all;
         }
-    </style>
+';
+
+    /**
+     * Document shell shared by the OAuth screens.
+     *
+     * @param string $body    Already-escaped markup for the card
+     * @param string $script  Optional trailing script; only the code page needs one
+     */
+    private function renderPage(
+        string $title,
+        string $body,
+        bool $centered = false,
+        string $script = ''
+    ): string {
+        return '<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>' . htmlspecialchars($title) . '</title>
+    <style>' . self::PAGE_STYLES . '    </style>
 </head>
 <body>
-    <div class="container">
-        <div class="header">
+    <div class="container' . ($centered ? ' centered' : '') . '">
+' . $body . '    </div>' . $script . '
+</body>
+</html>';
+    }
+
+    private function generateConsentTemplate(array $data): string
+    {
+        return $this->renderPage('Authorize MCP Access', '        <div class="header">
             <h1>Authorize MCP Access</h1>
         </div>
 
@@ -681,9 +738,7 @@ class OAuthAuthorizeEndpoint
                 <button type="submit" name="deny" value="1" class="deny">Cancel</button>
             </div>
         </form>
-    </div>
-</body>
-</html>';
+');
     }
 
     /**
@@ -715,124 +770,28 @@ class OAuthAuthorizeEndpoint
         string $message,
         string $code = ''
     ): string {
+        // .errorcode, not .code: the code page owns .code for its prominent bordered
+        // block, and one class meaning two different things across shared styles is how
+        // the copies drifted apart in the first place.
         $codeBlock = $code !== ''
             ? '
-        <p class="code">' . htmlspecialchars($code) . '</p>'
+        <p class="errorcode">' . htmlspecialchars($code) . '</p>'
             : '';
 
-        return '<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>' . htmlspecialchars($title) . '</title>
-    <style>
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-            margin: 0;
-            padding: 40px 20px;
-            background-color: #f5f5f5;
-        }
-        .container {
-            max-width: 500px;
-            margin: 0 auto;
-            background: white;
-            padding: 40px;
-            border-radius: 8px;
-            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
-            text-align: center;
-        }
-        h1 {
-            color: #333;
-            margin: 0 0 12px 0;
-            font-size: 20px;
-        }
-        p {
-            margin: 0;
-            color: #666;
-        }
-        .code {
-            margin-top: 16px;
-            display: inline-block;
-            padding: 6px 10px;
-            border-radius: 4px;
-            background: #f0f2f5;
-            font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-            font-size: 13px;
-            color: #333;
-            word-break: break-all;
-        }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>' . htmlspecialchars($heading) . '</h1>
+        return $this->renderPage(
+            $title,
+            '        <h1>' . htmlspecialchars($heading) . '</h1>
         <p>' . htmlspecialchars($message) . '</p>' . $codeBlock . '
-    </div>
-</body>
-</html>';
+',
+            centered: true
+        );
     }
 
     private function generateCodeDisplayTemplate(string $code, string $clientName): string
     {
-        return '<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Authorization Code</title>
-    <style>
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-            margin: 0;
-            padding: 40px 20px;
-            background-color: #f5f5f5;
-        }
-        .container {
-            max-width: 500px;
-            margin: 0 auto;
-            background: white;
-            padding: 40px;
-            border-radius: 8px;
-            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
-            text-align: center;
-        }
-        .success {
-            color: #28a745;
-            font-size: 24px;
-            margin-bottom: 20px;
-        }
-        .code {
-            background: #f8f9fa;
-            padding: 20px;
-            border-radius: 4px;
-            font-family: monospace;
-            font-size: 16px;
-            word-break: break-all;
-            margin: 20px 0;
-            border: 2px solid #007cba;
-        }
-        .instructions {
-            color: #666;
-            margin-top: 20px;
-        }
-        .copy-button {
-            background: #007cba;
-            color: white;
-            border: none;
-            padding: 10px 20px;
-            border-radius: 4px;
-            cursor: pointer;
-            margin-top: 10px;
-        }
-        .copy-button:hover {
-            background: #005a87;
-        }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <div class="success">✓ Authorization Successful</div>
+        return $this->renderPage(
+            'Authorization Code',
+            '        <div class="success">✓ Authorization Successful</div>
         
         <p>Authorization code for <strong>' . htmlspecialchars($clientName) . '</strong>:</p>
         
@@ -843,9 +802,10 @@ class OAuthAuthorizeEndpoint
         <div class="instructions">
             <p>Copy this code and paste it into your MCP client application.</p>
             <p><strong>Note:</strong> This code expires in 10 minutes.</p>
-        </div>
-    </div>
-
+    
+',
+            centered: true,
+            script: '
     <script>
         function copyCode() {
             const codeElement = document.getElementById("authCode");
@@ -866,8 +826,7 @@ class OAuthAuthorizeEndpoint
                 alert("Code copied to clipboard!");
             }
         }
-    </script>
-</body>
-</html>';
+    </script>'
+        );
     }
 }
