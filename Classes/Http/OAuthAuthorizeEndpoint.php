@@ -41,6 +41,13 @@ class OAuthAuthorizeEndpoint
                 return $this->handleApproval($request, $beUserId);
             }
 
+            // Handle an explicit refusal. Declining is a normal outcome of a consent
+            // screen, not an error, and the client has to be told — otherwise it waits
+            // for a callback that never comes.
+            if ($request->getMethod() === 'POST' && isset($postParams['deny'])) {
+                return $this->handleDenial($request);
+            }
+
             // Show consent form
             return $this->showConsentForm($request);
 
@@ -150,6 +157,69 @@ class OAuthAuthorizeEndpoint
                 'Set-Cookie' => 'tx_mcpserver_oauth=' . $oauthDataEncoded . '; ' . $cookieFlags
             ]
         );
+    }
+
+    /**
+     * The user declined on the consent screen.
+     *
+     * RFC 6749 §4.1.2.1: a refusal is reported to the client as
+     * ``error=access_denied`` on the registered redirect_uri, carrying ``state`` back.
+     * Before this existed the Cancel button only tried ``window.close()``, which browsers
+     * refuse for a tab they did not open via window.open — so the button did nothing and
+     * the client sat waiting for a callback that was never coming.
+     *
+     * The redirect_uri is validated against the registered client *before* redirecting to
+     * it. Skipping that would turn this endpoint into an open redirector, reachable with
+     * nothing but a crafted link.
+     */
+    private function handleDenial(ServerRequestInterface $request): ResponseInterface
+    {
+        $queryParams = $request->getQueryParams();
+        $postParams = $request->getParsedBody() ?: [];
+
+        $providedCsrf = (string)($postParams['csrf_token'] ?? '');
+        if (!$this->verifyCsrfToken($providedCsrf)) {
+            return $this->createErrorResponse('invalid_request', 'Invalid or missing CSRF token');
+        }
+
+        $clientId = $queryParams['client_id'] ?? $postParams['client_id'] ?? '';
+        $redirectUri = $queryParams['redirect_uri'] ?? '';
+        $state = $postParams['state'] ?? $queryParams['state'] ?? '';
+
+        $oauthService = GeneralUtility::makeInstance(OAuthService::class);
+        $client = $oauthService->getClient((string)$clientId);
+        if ($client === null) {
+            return $this->createErrorResponse('invalid_client', 'Unknown client_id');
+        }
+        if ($redirectUri !== '' && !$oauthService->isRedirectUriAllowed($client, $redirectUri)) {
+            return $this->createErrorResponse('invalid_request', 'redirect_uri is not registered for this client');
+        }
+
+        // No code was issued, but the token is spent either way: reopening the
+        // authorization link mints a fresh one.
+        $this->clearCsrfToken();
+
+        if (!empty($redirectUri)) {
+            $separator = strpos($redirectUri, '?') !== false ? '&' : '?';
+            $redirectUrl = $redirectUri . $separator . 'error=access_denied'
+                . '&error_description=' . urlencode('The user declined the authorization request');
+            if (!empty($state)) {
+                $redirectUrl .= '&state=' . urlencode($state);
+            }
+
+            $stream = new Stream('php://temp', 'rw');
+            $stream->write('');
+            $stream->rewind();
+
+            return new Response($stream, 302, ['Location' => $redirectUrl]);
+        }
+
+        // Without a redirect_uri there is nobody to notify, so tell the user instead.
+        $stream = new Stream('php://temp', 'rw');
+        $stream->write($this->generateDeclinedTemplate());
+        $stream->rewind();
+
+        return new Response($stream, 200, ['Content-Type' => 'text/html; charset=utf-8']);
     }
 
     private function handleApproval(ServerRequestInterface $request, int $beUserId): ResponseInterface
@@ -281,7 +351,19 @@ class OAuthAuthorizeEndpoint
         $beUser = $GLOBALS['BE_USER'];
         $username = $beUser->user['username'] ?? 'Unknown';
 
+        // Which installation is being authorized. A consent screen exists so the user can
+        // decide, and on a fleet of similarly-named environments behind one MCP connector
+        // "Authorize MCP Access" alone withholds the fact the decision turns on.
+        //
+        // sitename identifies the installation family, the host identifies the environment
+        // — and the host is what the user can cross-check against their address bar.
+        // Deliberately no application-context badge: it is not reliably configured on every
+        // installation, and a "Production" label on a staging box would be worse than none.
+        $siteName = trim((string)($GLOBALS['TYPO3_CONF_VARS']['SYS']['sitename'] ?? ''));
+
         $html = $this->generateConsentTemplate([
+            'site_name' => htmlspecialchars($siteName !== '' ? $siteName : 'TYPO3'),
+            'host' => htmlspecialchars($request->getUri()->getHost()),
             'username' => htmlspecialchars($username),
             'client_name' => htmlspecialchars($clientName),
             'client_id' => htmlspecialchars($clientId),
@@ -289,7 +371,6 @@ class OAuthAuthorizeEndpoint
             'code_challenge' => htmlspecialchars($codeChallenge),
             'code_challenge_method' => htmlspecialchars($challengeMethod),
             'state' => htmlspecialchars($state),
-            'user_id' => $beUser->user['uid'],
             'csrf_token' => htmlspecialchars($this->getOrCreateCsrfToken()),
         ]);
 
@@ -477,12 +558,35 @@ class OAuthAuthorizeEndpoint
         .deny:hover {
             background: #333;
         }
+        .target {
+            margin-bottom: 20px;
+            padding: 16px 20px;
+            border: 1px solid #ddd;
+            border-left: 4px solid #007cba;
+            border-radius: 4px;
+        }
+        .target-name {
+            font-weight: 600;
+            color: #333;
+        }
+        .target-host {
+            margin-top: 4px;
+            font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+            font-size: 13px;
+            color: #666;
+            word-break: break-all;
+        }
     </style>
 </head>
 <body>
     <div class="container">
         <div class="header">
             <h1>Authorize MCP Access</h1>
+        </div>
+
+        <div class="target">
+            <div class="target-name">' . $data['site_name'] . '</div>
+            <div class="target-host">' . $data['host'] . '</div>
         </div>
 
         <div class="info">
@@ -511,14 +615,64 @@ class OAuthAuthorizeEndpoint
             <input type="hidden" name="code_challenge" value="' . $data['code_challenge'] . '">
             <input type="hidden" name="code_challenge_method" value="' . $data['code_challenge_method'] . '">
             <input type="hidden" name="state" value="' . $data['state'] . '">
-            <input type="hidden" name="user_id" value="' . $data['user_id'] . '">
             <input type="hidden" name="csrf_token" value="' . $data['csrf_token'] . '">
 
             <div class="buttons">
                 <button type="submit" name="approve" value="1" class="approve">Authorize Access</button>
-                <button type="button" class="deny" onclick="window.close()">Cancel</button>
+                <button type="submit" name="deny" value="1" class="deny">Cancel</button>
             </div>
         </form>
+    </div>
+</body>
+</html>';
+    }
+
+    /**
+     * Shown when the user declined and there is no redirect_uri to report it to.
+     *
+     * Carries its own small style block rather than sharing the consent form's: unifying
+     * the three OAuth screens onto one shell (and giving them a dark scheme) is a separate
+     * job, and doing it here would bury this change in a restyling diff.
+     */
+    private function generateDeclinedTemplate(): string
+    {
+        return '<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Authorization Declined</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            margin: 0;
+            padding: 40px 20px;
+            background-color: #f5f5f5;
+        }
+        .container {
+            max-width: 500px;
+            margin: 0 auto;
+            background: white;
+            padding: 40px;
+            border-radius: 8px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+            text-align: center;
+        }
+        h1 {
+            color: #333;
+            margin: 0 0 12px 0;
+            font-size: 20px;
+        }
+        p {
+            margin: 0;
+            color: #666;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Authorization declined</h1>
+        <p>No access was granted. You can close this tab.</p>
     </div>
 </body>
 </html>';
