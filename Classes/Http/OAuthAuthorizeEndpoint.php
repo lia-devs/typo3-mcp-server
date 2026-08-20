@@ -7,9 +7,11 @@ namespace Hn\McpServer\Http;
 use Hn\McpServer\Service\OAuthService;
 use Psr\Http\Message\ResponseInterface;
 use Psr\Http\Message\ServerRequestInterface;
+use Psr\Log\LoggerInterface;
 use TYPO3\CMS\Core\Authentication\BackendUserAuthentication;
 use TYPO3\CMS\Core\Http\Response;
 use TYPO3\CMS\Core\Http\Stream;
+use TYPO3\CMS\Core\Log\LogManager;
 use TYPO3\CMS\Core\Utility\GeneralUtility;
 
 /**
@@ -18,6 +20,8 @@ use TYPO3\CMS\Core\Utility\GeneralUtility;
 class OAuthAuthorizeEndpoint
 {
     use RequestUrlTrait;
+
+    private ?LoggerInterface $logger = null;
 
     public function __invoke(ServerRequestInterface $request): ResponseInterface
     {
@@ -52,7 +56,12 @@ class OAuthAuthorizeEndpoint
             return $this->showConsentForm($request);
 
         } catch (\Throwable $e) {
-            return $this->createErrorResponse('server_error', $e->getMessage());
+            return $this->createErrorResponse(
+                $request,
+                'server_error',
+                'The authorization request could not be processed.',
+                $e->getMessage()
+            );
         }
     }
 
@@ -179,7 +188,7 @@ class OAuthAuthorizeEndpoint
 
         $providedCsrf = (string)($postParams['csrf_token'] ?? '');
         if (!$this->verifyCsrfToken($providedCsrf)) {
-            return $this->createErrorResponse('invalid_request', 'Invalid or missing CSRF token');
+            return $this->createErrorResponse($request, 'invalid_request', 'Invalid or missing CSRF token');
         }
 
         $clientId = $queryParams['client_id'] ?? $postParams['client_id'] ?? '';
@@ -189,10 +198,10 @@ class OAuthAuthorizeEndpoint
         $oauthService = GeneralUtility::makeInstance(OAuthService::class);
         $client = $oauthService->getClient((string)$clientId);
         if ($client === null) {
-            return $this->createErrorResponse('invalid_client', 'Unknown client_id');
+            return $this->createErrorResponse($request, 'invalid_client', 'Unknown client_id');
         }
         if ($redirectUri !== '' && !$oauthService->isRedirectUriAllowed($client, $redirectUri)) {
-            return $this->createErrorResponse('invalid_request', 'redirect_uri is not registered for this client');
+            return $this->createErrorResponse($request, 'invalid_request', 'redirect_uri is not registered for this client');
         }
 
         // No code was issued, but the token is spent either way: reopening the
@@ -232,7 +241,7 @@ class OAuthAuthorizeEndpoint
         // being tricked into auto-submitting approve=1 from an attacker page.
         $providedCsrf = (string)($postParams['csrf_token'] ?? '');
         if (!$this->verifyCsrfToken($providedCsrf)) {
-            return $this->createErrorResponse('invalid_request', 'Invalid or missing CSRF token');
+            return $this->createErrorResponse($request, 'invalid_request', 'Invalid or missing CSRF token');
         }
 
         $clientId = $queryParams['client_id'] ?? $postParams['client_id'] ?? '';
@@ -248,22 +257,22 @@ class OAuthAuthorizeEndpoint
         // form's checks by POSTing directly to this endpoint.
         $client = $oauthService->getClient((string)$clientId);
         if ($client === null) {
-            return $this->createErrorResponse('invalid_client', 'Unknown client_id');
+            return $this->createErrorResponse($request, 'invalid_client', 'Unknown client_id');
         }
         if ($redirectUri !== '' && !$oauthService->isRedirectUriAllowed($client, $redirectUri)) {
-            return $this->createErrorResponse('invalid_request', 'redirect_uri is not registered for this client');
+            return $this->createErrorResponse($request, 'invalid_request', 'redirect_uri is not registered for this client');
         }
 
         // Only S256 is supported for PKCE
         if (!empty($pkceChallenge) && $challengeMethod !== 'S256') {
-            return $this->createErrorResponse('invalid_request', 'Only S256 code_challenge_method is supported');
+            return $this->createErrorResponse($request, 'invalid_request', 'Only S256 code_challenge_method is supported');
         }
 
         // MCP authorization spec: public clients (no client_secret) MUST use PKCE.
         // Without a challenge, mere possession of the code would be enough to mint
         // a token, since verifyClientSecret() short-circuits for public clients.
         if (($client['token_endpoint_auth_method'] ?? 'none') === 'none' && $pkceChallenge === '') {
-            return $this->createErrorResponse('invalid_request', 'Public clients must use PKCE (code_challenge is required)');
+            return $this->createErrorResponse($request, 'invalid_request', 'Public clients must use PKCE (code_challenge is required)');
         }
 
         // CSRF token has been used — rotate it so a submitted form can't be replayed.
@@ -327,16 +336,16 @@ class OAuthAuthorizeEndpoint
         $oauthService = GeneralUtility::makeInstance(OAuthService::class);
         $client = $oauthService->getClient((string)$clientId);
         if ($client === null) {
-            return $this->createErrorResponse('invalid_client', 'Unknown client_id');
+            return $this->createErrorResponse($request, 'invalid_client', 'Unknown client_id');
         }
         if ($redirectUri !== '' && !$oauthService->isRedirectUriAllowed($client, $redirectUri)) {
-            return $this->createErrorResponse('invalid_request', 'redirect_uri is not registered for this client');
+            return $this->createErrorResponse($request, 'invalid_request', 'redirect_uri is not registered for this client');
         }
 
         // MCP authorization spec: public clients (no secret) MUST use PKCE.
         // Reject early so the user isn't asked to consent to something we'd later refuse.
         if (($client['token_endpoint_auth_method'] ?? 'none') === 'none' && $codeChallenge === '') {
-            return $this->createErrorResponse('invalid_request', 'Public clients must use PKCE (code_challenge is required)');
+            return $this->createErrorResponse($request, 'invalid_request', 'Public clients must use PKCE (code_challenge is required)');
         }
 
         // Prefer the name the client supplied during dynamic registration; fall
@@ -438,22 +447,72 @@ class OAuthAuthorizeEndpoint
         }
     }
 
-    private function createErrorResponse(string $error, string $description = ''): ResponseInterface
-    {
-        $errorData = [
-            'error' => $error,
-            'error_description' => $description
-        ];
+    /**
+     * An error on the authorize endpoint, rendered for whoever is actually asking.
+     *
+     * This endpoint is reached by a top-level browser navigation, so the default is a
+     * page: a person who is handed `{"error":"invalid_request", …}` learns nothing they
+     * can act on. JSON is still served when the caller explicitly asks for it via
+     * ``Accept``, which keeps `curl -H 'Accept: application/json'` working — that is how
+     * these environments get diagnosed during a rollout.
+     *
+     * Both representations render from the same two values, so they cannot drift apart
+     * and describe the failure differently.
+     *
+     * Note this covers only the errors that *cannot* be reported to the client: an
+     * unknown client_id or an unregistered redirect_uri must not be redirected to
+     * (RFC 6749 §4.1.2.1), so there is no machine to inform. Where the redirect_uri is
+     * validated, the client is told through the redirect instead — see handleDenial().
+     *
+     * @param string|null $logDetail Kept out of the response entirely; exception messages
+     *                               and other internals belong in the log, and putting
+     *                               them on a page that now looks trustworthy would be
+     *                               worse than the bare JSON ever was.
+     */
+    private function createErrorResponse(
+        ServerRequestInterface $request,
+        string $error,
+        string $description = '',
+        ?string $logDetail = null
+    ): ResponseInterface {
+        $this->getLogger()->warning(
+            'OAuth authorize refused: ' . $error,
+            array_filter(['description' => $description, 'detail' => $logDetail])
+        );
+
+        // A deliberately blunt check rather than full q-value negotiation: there are two
+        // representations, browsers never ask for application/json, and anything that
+        // does ask wants the machine one.
+        if (str_contains($request->getHeaderLine('Accept'), 'application/json')) {
+            $stream = new Stream('php://temp', 'rw');
+            $stream->write((string)json_encode([
+                'error' => $error,
+                'error_description' => $description,
+            ]));
+            $stream->rewind();
+
+            return new Response($stream, 400, ['Content-Type' => 'application/json']);
+        }
 
         $stream = new Stream('php://temp', 'rw');
-        $stream->write(json_encode($errorData));
+        $stream->write($this->generateNoticeTemplate(
+            'Authorization failed',
+            'Authorization failed',
+            $description !== '' ? $description : 'The authorization request was refused.',
+            $error
+        ));
         $stream->rewind();
 
-        return new Response(
-            $stream,
-            400,
-            ['Content-Type' => 'application/json']
-        );
+        return new Response($stream, 400, ['Content-Type' => 'text/html; charset=utf-8']);
+    }
+
+    private function getLogger(): LoggerInterface
+    {
+        if ($this->logger === null) {
+            $this->logger = GeneralUtility::makeInstance(LogManager::class)->getLogger(static::class);
+        }
+
+        return $this->logger;
     }
 
 
@@ -629,19 +688,44 @@ class OAuthAuthorizeEndpoint
 
     /**
      * Shown when the user declined and there is no redirect_uri to report it to.
-     *
-     * Carries its own small style block rather than sharing the consent form's: unifying
-     * the three OAuth screens onto one shell (and giving them a dark scheme) is a separate
-     * job, and doing it here would bury this change in a restyling diff.
      */
     private function generateDeclinedTemplate(): string
     {
+        return $this->generateNoticeTemplate(
+            'Authorization Declined',
+            'Authorization declined',
+            'No access was granted. You can close this tab.'
+        );
+    }
+
+    /**
+     * A short single-message page: a declined authorization, or a refused request.
+     *
+     * Shares one style block between those cases instead of each carrying a copy. The
+     * consent form still has its own — folding that in means restyling a screen editors
+     * already know, which belongs in its own change rather than hidden in this one.
+     *
+     * $code is the OAuth error code, shown verbatim when present. A screenshot reading
+     * "invalid_request" is a support request somebody can act on; "something went wrong"
+     * is not.
+     */
+    private function generateNoticeTemplate(
+        string $title,
+        string $heading,
+        string $message,
+        string $code = ''
+    ): string {
+        $codeBlock = $code !== ''
+            ? '
+        <p class="code">' . htmlspecialchars($code) . '</p>'
+            : '';
+
         return '<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Authorization Declined</title>
+    <title>' . htmlspecialchars($title) . '</title>
     <style>
         body {
             font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
@@ -667,12 +751,23 @@ class OAuthAuthorizeEndpoint
             margin: 0;
             color: #666;
         }
+        .code {
+            margin-top: 16px;
+            display: inline-block;
+            padding: 6px 10px;
+            border-radius: 4px;
+            background: #f0f2f5;
+            font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+            font-size: 13px;
+            color: #333;
+            word-break: break-all;
+        }
     </style>
 </head>
 <body>
     <div class="container">
-        <h1>Authorization declined</h1>
-        <p>No access was granted. You can close this tab.</p>
+        <h1>' . htmlspecialchars($heading) . '</h1>
+        <p>' . htmlspecialchars($message) . '</p>' . $codeBlock . '
     </div>
 </body>
 </html>';
