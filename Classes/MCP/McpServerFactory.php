@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Hn\McpServer\MCP;
 
+use Composer\InstalledVersions;
 use Mcp\Server\Server;
 use Mcp\Server\InitializationOptions;
 use Mcp\Server\NotificationOptions;
@@ -20,6 +21,11 @@ use TYPO3\CMS\Core\Information\Typo3Version;
  */
 class McpServerFactory
 {
+    /**
+     * Composer package of this extension, for the installed-build lookup below.
+     */
+    private const PACKAGE = 'hn/typo3-mcp-server';
+
     public function __construct(
         private readonly ToolRegistry $toolRegistry
     ) {}
@@ -65,12 +71,38 @@ class McpServerFactory
     /**
      * Get the server version string including extension and TYPO3 versions
      */
+    /**
+     * The version reported in the initialize handshake's serverInfo.
+     *
+     * Shape: "dev-main+<commit> (TYPO3 13.4.34)", or "1.2.0 (TYPO3 …)" for a
+     * tagged install.
+     *
+     * The declared version cannot answer "is this installation current?" for
+     * anyone installing from a branch: in a Composer install TYPO3 reports the
+     * Composer version, so every commit of a branch calls itself
+     * "dev-<branch>" (and in a classic install, every commit calls itself
+     * whatever ext_emconf.php says). The installed commit is the version that
+     * actually distinguishes them, and Composer knows it at runtime, so it
+     * rides along in the semver-sanctioned build position: the string stays a
+     * valid version for anything that parses it, and a client can hold it
+     * against the branch's head.
+     *
+     * The suffix is omitted when Composer does not know this package (a classic
+     * install, or an extension dropped into typo3conf/ext), which degrades to
+     * exactly the previous output rather than to a wrong commit.
+     */
     public function getServerVersion(): string
     {
         $extVersion = ExtensionManagementUtility::getExtensionVersion('mcp_server');
         $typo3Version = GeneralUtility::makeInstance(Typo3Version::class)->getVersion();
 
-        return $extVersion . ' (TYPO3 ' . $typo3Version . ')';
+        $reference = InstalledVersions::isInstalled(self::PACKAGE)
+            ? InstalledVersions::getReference(self::PACKAGE)
+            : null;
+
+        return $extVersion
+            . ($reference !== null ? '+' . $reference : '')
+            . ' (TYPO3 ' . $typo3Version . ')';
     }
 
     /**
