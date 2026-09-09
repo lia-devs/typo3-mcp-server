@@ -42,6 +42,10 @@ services:
   # Make OAuthService public for eID access
   Hn\McpServer\Service\OAuthService:
     public: true
+
+  # Make McpAuthenticationService public for endpoint access
+  Hn\McpServer\Service\McpAuthenticationService:
+    public: true
     
   # Make SiteInformationService public for eID access
   Hn\McpServer\Service\SiteInformationService:

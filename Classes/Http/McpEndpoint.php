@@ -15,6 +15,7 @@ use Mcp\Server\Transport\Http\HttpMessage;
 use Psr\Http\Message\ResponseInterface;
 use Psr\Http\Message\ServerRequestInterface;
 use TYPO3\CMS\Core\Context\Context;
+use TYPO3\CMS\Core\Context\FileProcessingAspect;
 use TYPO3\CMS\Core\Context\UserAspect;
 use TYPO3\CMS\Core\Context\WorkspaceAspect;
 use TYPO3\CMS\Core\Core\Environment;
@@ -319,6 +320,12 @@ class McpEndpoint
         $context = GeneralUtility::makeInstance(Context::class);
         $context->setAspect('backend.user', new UserAspect($beUser));
         $context->setAspect('workspace', new WorkspaceAspect($workspaceId));
+
+        // Disable deferred image processing — DeferredBackendImageProcessor
+        // requires a full backend session with CSRF tokens, which the MCP
+        // endpoints do not have (bearer token only). Without this, every
+        // thumbnail request fails.
+        $context->setAspect('fileProcessing', new FileProcessingAspect(false));
 
         // Log workspace selection for debugging
         $this->logDebug("MCP: User {$userId} switched to workspace {$workspaceId}");
