@@ -8,6 +8,7 @@ use Doctrine\DBAL\ParameterType;
 use Hn\McpServer\Event\AfterRecordReadEvent;
 use Hn\McpServer\Event\BeforeRecordReadEvent;
 use Hn\McpServer\Exception\DatabaseException;
+use Hn\McpServer\Exception\McpException;
 use Hn\McpServer\Exception\ValidationException;
 use Mcp\Types\CallToolResult;
 use Psr\EventDispatcher\EventDispatcherInterface;
@@ -100,7 +101,8 @@ class ReadTableTool extends AbstractRecordTool
         }
 
         return [
-            'description' => 'Read records from TYPO3 tables with filtering, pagination, and relation embedding. Also provides access to the fileadmin: read sys_file to browse available files and images. By default, returns records from ALL languages mixed together (matching TYPO3\'s list module behavior). Use the language parameter to filter to a specific language. For page content, use pid filter instead of individual record lookups.',
+            'description' => 'Read records from TYPO3 tables with filtering, pagination, and relation embedding. Also provides access to the fileadmin: read sys_file to browse available files and images. By default, returns records from ALL languages mixed together (matching TYPO3\'s list module behavior). Use the language parameter to filter to a specific language. For page content, use pid filter instead of individual record lookups. ' .
+                'FLEXFORM FIELDS (e.g. pi_flexform) are returned as nested JSON objects across all sheets, e.g. {"settings": {"orderBy": "datetime"}, "persistence": {"storagePid": "12"}} — the same shape WriteTable accepts, so a value read here can be written straight back. Send that JSON, never the stored XML.',
             'inputSchema' => [
                 'type' => 'object',
                 'properties' => $properties,
@@ -587,44 +589,28 @@ class ReadTableTool extends AbstractRecordTool
 
         // Convert FlexForm XML to JSON
         if ($this->tableAccessService->isFlexFormField($table, $field) && is_string($value) && !empty($value) && strpos($value, '<?xml') === 0) {
-            try {
-                // Use TYPO3's FlexFormService to convert XML to array. The
-                // class is aliased to FlexFormTools in TYPO3 14 (#107945) but
-                // the method signature is identical.
-                $flexFormService = GeneralUtility::makeInstance(FlexFormService::class);
-                $flexFormArray = $flexFormService->convertFlexFormContentToArray($value);
-
-                // Simplify the structure for easier use in LLMs
-                $result = [];
-                $settings = [];
-
-                // Process each field and organize settings
-                foreach ($flexFormArray as $key => $val) {
-                    // Check if this is a settings field (key starts with "settings")
-                    if (strpos($key, 'settings') === 0 && strlen($key) > 8) {
-                        // Extract the setting name (remove "settings" prefix)
-                        $settingName = substr($key, 8);
-                        // Convert first character to lowercase if it's uppercase
-                        if (ctype_upper($settingName[0])) {
-                            $settingName = lcfirst($settingName);
-                        }
-                        $settings[$settingName] = $val;
-                    } else {
-                        $result[$key] = $val;
-                    }
-                }
-
-                // Add settings to result if any were found
-                if (!empty($settings)) {
-                    $result['settings'] = $settings;
-                }
-
-                return $result;
-            } catch (\Exception $e) {
-                // Log the error but continue with empty result
-                $this->logException($e, 'parsing flexform XML');
-                return [];
+            // Validate the XML explicitly: xml2array() returns an error STRING
+            // for unparseable XML, and FlexFormService would silently turn
+            // that into an empty array (its `['data'] ?? []` swallows the
+            // error string). A silently empty result would hide data
+            // corruption from the client — report it instead.
+            $parsed = GeneralUtility::xml2array($value);
+            if (!is_array($parsed)) {
+                throw new McpException(
+                    "Failed to parse the stored FlexForm XML of $table.$field: $parsed",
+                    "The FlexForm value of $table.$field cannot be parsed; the stored XML is invalid.",
+                    422
+                );
             }
+
+            // Use TYPO3's FlexFormService to convert XML to array. The
+            // class is aliased to FlexFormTools in TYPO3 14 (#107945) but
+            // the method signature is identical. It flattens all sheets
+            // and expands every dotted field name into a nested structure
+            // ("persistence.storagePid" => {"persistence": {"storagePid":
+            // ...}}) — symmetric to what WriteTable accepts as input.
+            $flexFormService = GeneralUtility::makeInstance(FlexFormService::class);
+            return $flexFormService->convertFlexFormContentToArray($value);
         }
 
         // Convert JSON strings to arrays

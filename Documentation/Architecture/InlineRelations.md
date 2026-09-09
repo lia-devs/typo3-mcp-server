@@ -2,7 +2,7 @@
 
 ## Overview
 
-TYPO3 inline relations (IRRE - Inline Relational Record Editing) allow records to be related to each other in parent-child relationships. The MCP tools support both reading and writing inline relations with some limitations.
+TYPO3 inline relations (IRRE - Inline Relational Record Editing) allow records to be related to each other in parent-child relationships. The MCP tools support both reading and writing inline relations using DataHandler's native inline handling.
 
 ## Types of Inline Relations
 
@@ -10,7 +10,7 @@ TYPO3 inline relations (IRRE - Inline Relational Record Editing) allow records t
 - Tables that exist independently (e.g., `tt_content`)
 - Have `hideTable = false` in TCA
 - Displayed as UIDs in read results
-- Can be managed through foreign field updates
+- Written by passing an array of UIDs
 
 Example:
 ```php
@@ -19,45 +19,15 @@ $result = $readTool->execute([
     'table' => 'tx_news_domain_model_news',
     'uid' => 123
 ]);
-// Returns: 
+// Returns:
 // ['content_elements' => [456, 789, 1011]]  // Array of UIDs
 ```
 
 ### 2. Embedded/Dependent Inline Relations
 - Tables that only exist as children (e.g., `sys_file_reference`, `tx_news_domain_model_link`)
-- Have `hideTable = true` in TCA **AND** are not listed in the `additionalStandaloneTables` extension setting
+- Have `hideTable = true` in TCA
 - Displayed as full embedded records in read results
-- Should be created together with parent record
-
-### 3. Standalone Exposure of `hideTable` Children
-
-Some `hideTable=true` tables have inline structure that's too complex to be safely
-edited through the parent — for example translations independent of the parent's
-language, or rows whose visibility depends on permissions of a different table.
-For these, embedding makes the parent's update path either lossy (drops
-translations the LLM didn't echo back) or unsafe (replaces rows the LLM never
-intended to touch).
-
-The extension setting `additionalStandaloneTables` opts a `hideTable` table out
-of embedding. Such tables stay hidden in the TYPO3 backend list module (TCA is
-not modified), but the MCP tools treat them as ordinary independent tables:
-
-- `ListTables` shows them
-- `ReadTable` / `WriteTable` allow direct CRUD
-- The parent's inline field collapses to a list of child UIDs, just like for
-  any independent relation
-
-`sys_file_metadata` is on this list by default. It has `hideTable=true` plus
-its own `languageField`, while its parent `sys_file` is read-only and not
-language-aware — embedding made translations invisible and edits dangerous.
-Exposing it standalone gives the LLM normal `update` and `translate` semantics
-on title/alternative/description, while the read path on `sys_file` still
-yields `metadata: [<uid>, ...]` as a discovery hint.
-
-Mount restrictions on `sys_file` propagate transitively to
-`sys_file_metadata` via a subquery in `SysFileMetadataRestrictionListener` —
-non-admin users only see metadata for files they could read on `sys_file`.
-The same subquery filters orphaned metadata pointing at non-existent files.
+- Written by passing record data arrays
 
 Example:
 ```php
@@ -75,8 +45,8 @@ $result = $readTool->execute([
 
 ## Writing Inline Relations
 
-### Method 1: Foreign Field Update (Currently Working)
-For independent relations, update the foreign field on child records:
+### Method 1: Foreign Field Update
+For independent relations, update the foreign field on child records directly:
 
 ```php
 // Create content element related to news
@@ -92,7 +62,7 @@ $writeTool->execute([
 ]);
 ```
 
-### Method 2: Parent Record Update with UIDs (Implemented)
+### Method 2: Parent Record with UIDs
 For independent relations, pass array of UIDs when updating parent:
 
 ```php
@@ -105,10 +75,11 @@ $writeTool->execute([
         'content_elements' => [456, 789, 1011]  // Array of UIDs
     ]
 ]);
+// Children not in the list are automatically unlinked (foreign_field set to 0)
 ```
 
-### Method 3: Embedded Record Creation (Partially Working)
-For dependent relations, pass record data when creating parent:
+### Method 3: Embedded Record Creation
+For dependent relations, pass record data arrays:
 
 ```php
 // Create news with embedded links
@@ -124,18 +95,25 @@ $writeTool->execute([
         ]
     ]
 ]);
+// On update, children not in the list are automatically deleted
 ```
 
-## Current Implementation
+### File References
+File fields accept sys_file UIDs or record data objects:
 
-### 1. Embedded Relations with Direct Database Updates
-- Creating embedded relations through parent record works with a two-step process:
-  1. DataHandler creates the child records with placeholder IDs
-  2. Direct database UPDATE sets the foreign field after creation
-- The foreign field (e.g., `parent` in `tx_news_domain_model_link`) is NOT defined in the child table's TCA columns by design
-- DataHandler only processes fields that are defined in TCA columns, so it ignores the foreign field
-- **Solution**: After DataHandler creates child records, we directly update the foreign field in the database
-- **Working Example**: Creating news with embedded links now works correctly
+```php
+$writeTool->execute([
+    'table' => 'tt_content',
+    'action' => 'create',
+    'pid' => 1,
+    'data' => [
+        'header' => 'With images',
+        'CType' => 'textmedia',
+        'assets' => [3, 4]  // sys_file UIDs (shorthand)
+    ]
+]);
+// Context fields (tablenames, fieldname, table_local) are set server-side
+```
 
 ### 2. File References (sys_file_reference)
 - `sys_file_reference` is fully supported as an embedded inline relation (`hideTable=true`)
@@ -144,27 +122,91 @@ $writeTool->execute([
 - `foreign_match_fields` (`tablenames`, `fieldname`) ensure references are scoped to the correct parent field
 - File references are enriched with metadata from `sys_file` (filename, identifier, mime type, public URL)
 - `sys_file` itself is read-only - files are managed through the filesystem, not direct DB edits
-- New files are created with the `UploadFile` tool (from a URL, a YouTube/Vimeo link, text content,
-  or a pre-signed upload); the resulting `sys_file` uid is then referenced via `uid_local`
+- New files are created with `UploadFile` (Base64), `ImportFileFromUrl` (server-side download) or
+  `GetUploadCredentials` (pre-signed HTTP upload); the resulting `sys_file` uid is then referenced
+  via `uid_local`
 
-### 3. Automatic Workspace Handling
+## Implementation
+
+### Single DataHandler Call (Unified dataMap)
+
+All inline relations — parent record and children — are processed in a **single DataHandler call** using a unified `$dataMap`. DataHandler natively resolves NEW key references, sets foreign_field values, and handles workspace versioning atomically.
+
+```php
+$dataMap = [
+    'tx_news_domain_model_news' => [
+        'NEWparent' => [
+            'title' => 'News with links',
+            'pid' => 1,
+            'related_links' => 'NEWchild1,NEWchild2',  // CSV of child keys
+        ],
+    ],
+    'tx_news_domain_model_link' => [
+        'NEWchild1' => ['title' => 'Link 1', 'uri' => 'https://example.com', 'pid' => 1],
+        'NEWchild2' => ['title' => 'Link 2', 'uri' => 't3://page?uid=42', 'pid' => 1],
+    ],
+];
+$dataHandler->start($dataMap, []);
+$dataHandler->process_datamap();
+```
+
+Key methods:
+- **`extractInlineRelations()`** — Separates inline/file fields from parent data
+- **`buildInlineDataMap()`** — Builds the unified dataMap with NEW keys and CSV references, handles nested inline relations recursively
+- **`syncInlineRelations()`** — On updates only: deletes/unlinks children absent from the new list (DataHandler's raw dataMap does not handle relation sync — that's FormEngine's job)
+
+### Relation Sync on Updates
+
+DataHandler's raw `process_datamap()` does **not** automatically remove children that are no longer listed. The `syncInlineRelations()` method handles this explicitly:
+
+- **Embedded tables** (`hideTable = true`): Absent children are deleted via DataHandler `cmdMap`
+- **Independent tables** (`hideTable = false`): Absent children have their `foreign_field` cleared via DataHandler `dataMap`
+
+Both paths go through DataHandler, ensuring proper workspace versioning.
+
+#### Scoping the orphan lookup
+
+Which children currently exist is looked up in the child table, and that lookup **must**
+apply every context column TCA declares:
+
+- `foreign_table_field` → compared against the parent table
+- `foreign_match_fields` → each entry compared against its configured value
+
+This is not optional for shared child tables. `sys_file_reference` holds the rows of every
+file field of every table, and its `foreign_field` (`uid_foreign`) only carries the parent
+UID. Matching on `uid_foreign` alone therefore collects every reference whose parent UID
+happens to be the same number — across unrelated tables and unrelated fields — and those
+rows are then treated as orphans and deleted. UIDs in the low hundreds collide between
+`pages`, `tt_content` and extension tables all the time, so this is the normal case, not an
+edge case.
+
+For TCA type `file` the core fills both keys in `TcaPreparation` (`tablenames` +
+`fieldname`), so they are always available. If they are ever missing for a
+`sys_file_reference` relation, the write is refused with a `ConfigurationException` rather
+than computing a destructive orphan set.
+
+### File Reference Security
+
+For `sys_file_reference`, context fields are **always set server-side**:
+- `tablenames` → parent table name
+- `fieldname` → parent field name
+- `table_local` → `sys_file`
+
+Client-supplied values for these fields are overwritten to prevent cross-table reference manipulation.
+
+### Automatic Workspace Handling
 - Both ReadTableTool and WriteTableTool automatically initialize workspace context via `WorkspaceContextService`
 - The service finds the first writable workspace or creates a new "MCP Workspace" if needed
 - All operations (read/write) happen in the same workspace automatically
-- No manual workspace management is needed in tests or usage
-- Workspace transparency is maintained - tools work consistently across workspaces
-
-### 4. Sorting and Positioning
-- Sorting is handled through `sorting` or `sorting_foreign` fields
-- Position management (before/after) not fully implemented for inline relations
+- Workspace transparency is maintained — tools expose live UIDs only
 
 ## Best Practices
 
-1. **Use Foreign Field Method**: Most reliable method for creating inline relations
-2. **Check Table Configuration**: Verify if table has `hideTable` to determine relation type
-3. **Validate Data**: Ensure proper validation for inline relation data
-4. **Handle Errors**: Check DataHandler error log for detailed error messages
-5. **Test Thoroughly**: Inline relations can behave differently in various contexts
+1. **Use Embedded Data for Hidden Tables**: Pass record data arrays for `hideTable` relations, UIDs for independent tables
+2. **Check Table Configuration**: Verify `hideTable` in TCA to determine the relation type
+3. **Update Replaces Relations**: On updates, the provided list is the complete new state — absent children are removed
+4. **Nested Relations**: Supported recursively (e.g., file references on inline children)
+5. **Test Thoroughly**: Check all MCP tool calls for failure: `$this->assertFalse($result->isError, ...)`
 
 ## Technical Details
 
@@ -182,25 +224,20 @@ Inline relations are defined in TCA with type 'inline':
 ]
 ```
 
-### DataHandler Multi-Table Format
-DataHandler supports multi-table operations with placeholders:
+### Read vs Write Behavior
 
-```php
-$dataMap = [
-    'parent_table' => [
-        'NEW123' => ['field' => 'value']
-    ],
-    'child_table' => [
-        'NEW456' => ['other_field' => 'value']  // Note: foreign field NOT included
-    ]
-];
-// After DataHandler processing, foreign fields are updated directly:
-$connection->update('child_table', ['parent_field' => $parentUid], ['uid' => $childUid]);
-```
+| Aspect | Read (ReadTableTool) | Write (WriteTableTool) |
+|--------|---------------------|----------------------|
+| **Detection** | `hideTable` TCA flag | Per-item: arrays = embedded, integers = UIDs |
+| **Hidden tables** | Full embedded records | Accepts record data arrays |
+| **Visible tables** | UIDs only | Accepts UID arrays |
+| **Sorting** | `foreign_sortby` or default | CSV position determines order |
 
 ## Future Improvements
 
-1. **Batch Operations**: Support for bulk inline relation updates
+1. **Batch Operations**: Optimized bulk inline relation updates
 2. **Position Management**: Full support for positioning inline records (before/after specific records)
-3. **Validation Enhancement**: More comprehensive validation for embedded record data
-4. **Performance Optimization**: Batch foreign field updates instead of individual UPDATE queries
+3. **Recursion Limits**: Configurable depth limit for nested inline relations
+4. **Field Allowlisting**: Restrict which fields can be set on inline children
+5. **Validation Enhancement**: More comprehensive validation for embedded record data
+6. **Performance Optimization**: Batch foreign field updates instead of individual UPDATE queries
