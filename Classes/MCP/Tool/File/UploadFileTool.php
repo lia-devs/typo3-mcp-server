@@ -190,8 +190,15 @@ class UploadFileTool extends AbstractRecordTool
         // Resolve the endpoint URL before minting a token: a relative upload
         // URL is unusable for the client, so fail hard instead (typically
         // stdio mode without a fully qualified site base).
+        // "/mcp/upload" rather than "/mcp_upload": both spellings reach the same
+        // endpoint, but only this one sits inside the /mcp prefix. Access rules are
+        // written for that prefix -- a vHost that requires HTTP Basic auth and
+        // exempts the MCP surface, a proxy that allow-lists it -- so a pre-signed
+        // URL pointing outside it is answered by the webserver before PHP ever sees
+        // the bearer token. Measured on a Basic-auth-protected staging vHost:
+        // /mcp_upload returns Apache's 401, /mcp/upload returns 201.
         $siteInformation = GeneralUtility::makeInstance(SiteInformationService::class);
-        $endpointUrl = (string)$siteInformation->makeAbsoluteUrl('/mcp_upload');
+        $endpointUrl = (string)$siteInformation->makeAbsoluteUrl('/mcp/upload');
         if (!str_starts_with($endpointUrl, 'http://') && !str_starts_with($endpointUrl, 'https://')) {
             return $this->createErrorResult(
                 'Cannot build an absolute upload URL because no public base URL of this TYPO3 instance is known '

@@ -166,9 +166,10 @@ class UploadFileToolTest extends FunctionalTestCase
         $data = $this->executeUpload(['targetFolder' => '/user_upload/']);
 
         $this->assertEquals(
-            'https://example.com/mcp_upload',
+            'https://example.com/mcp/upload',
             $data['uploadUrl'],
-            'The upload URL must be absolute, resolved from the site base, and must not carry the token'
+            'The upload URL must be absolute, resolved from the site base, must not carry the token, '
+            . 'and must stay inside the /mcp prefix that access rules are written for'
         );
         $this->assertNotEmpty($data['uploadToken']);
         $this->assertEquals('1:/user_upload/', $data['targetFolder']);
@@ -186,7 +187,7 @@ class UploadFileToolTest extends FunctionalTestCase
     public function testPresignedUploadUrlIncludesSubdirectoryPrefix(): void
     {
         // TYPO3 installed at https://example.com/subdir/: the middleware routes
-        // /subdir/mcp_upload, so the generated URL must carry the prefix.
+        // /subdir/mcp/upload, so the generated URL must carry the prefix.
         $serverParams = [
             'HTTP_HOST' => 'example.com',
             'HTTPS' => 'on',
@@ -205,7 +206,7 @@ class UploadFileToolTest extends FunctionalTestCase
             $siteInformation->setCurrentRequest(null);
         }
 
-        $this->assertEquals('https://example.com/subdir/mcp_upload', $data['uploadUrl']);
+        $this->assertEquals('https://example.com/subdir/mcp/upload', $data['uploadUrl']);
     }
 
     public function testSchemaOffersDefaultTargetFolder(): void
