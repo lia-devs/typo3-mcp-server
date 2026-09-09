@@ -32,7 +32,7 @@ class McpServerModuleController
         private readonly PageRenderer $pageRenderer,
         private readonly OAuthService $oauthService,
         private readonly WorkspaceContextService $workspaceContextService,
-        private readonly UriBuilder $uriBuilder
+        private readonly UriBuilder $uriBuilder,
     ) {}
 
     public function mainAction(ServerRequestInterface $request): ResponseInterface
