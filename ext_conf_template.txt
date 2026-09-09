@@ -1,3 +1,6 @@
+# cat=site; type=int; label=Site Root Page ID:Root page ID of the TYPO3 site this MCP server is responsible for. Determines which domains are allowed and which base URL is used for CLI/OAuth. Set to 0 to allow all configured sites (no domain validation).
+siteRootPageId = 0
+
 # cat=mcp/tables; type=string; label=Additional read-only tables: Comma-separated list of non-workspace-capable tables to expose as read-only via MCP tools. These tables become available in ReadTable but cannot be written. Example: tx_blog_domain_model_author,tx_myext_domain_model_setting
 additionalReadOnlyTables = sys_file
 

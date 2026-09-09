@@ -11,6 +11,7 @@ use Symfony\Component\Console\Input\InputOption;
 use Symfony\Component\Console\Output\OutputInterface;
 use TYPO3\CMS\Core\Utility\GeneralUtility;
 use TYPO3\CMS\Core\Database\ConnectionPool;
+use Hn\McpServer\Service\BaseUrlService;
 use Hn\McpServer\Service\OAuthService;
 
 /**
@@ -72,7 +73,8 @@ class OAuthManageCommand extends Command
         }
 
         $clientName = $input->getOption('client-name');
-        $baseUrl = $GLOBALS['TYPO3_CONF_VARS']['SYS']['reverseProxyBaseUrl'] ?? 'https://your-domain.com';
+        $baseUrlService = GeneralUtility::makeInstance(BaseUrlService::class);
+        $baseUrl = $baseUrlService->getBaseUrlFromSiteConfiguration();
 
         $oauthService = GeneralUtility::makeInstance(OAuthService::class);
         $authUrl = $oauthService->generateAuthorizationUrl($baseUrl, $clientName);

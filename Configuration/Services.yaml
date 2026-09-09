@@ -50,7 +50,12 @@ services:
   # Make SiteInstructionsService public for server access
   Hn\McpServer\Server\SiteInstructionsService:
     public: true
-    
+
+  # Public for GeneralUtility::makeInstance() calls in OAuthManageCommand / PreviewFileTool
+  Hn\McpServer\Service\BaseUrlService:
+    public: true
+
+
   # Event listeners
   Hn\McpServer\EventListener\FileEnrichmentListener:
     tags:
