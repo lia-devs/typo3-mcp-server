@@ -133,6 +133,22 @@ This method gives you admin privileges by default. Add this to your mcp config f
 }
 ```
 
+### Listing the domains an instance serves
+
+A site's hosts are spread over its `base` and its `baseVariants`, so no single
+setting answers "which URLs belong to this installation?". Country variants and
+staging hosts are easy to miss when reading the site configuration by hand.
+`mcp:domains` prints the complete, deduplicated list as JSON:
+
+```bash
+vendor/bin/typo3 mcp:domains
+# {"domains": ["partner.example.org", "stage.example.com", "www.example.com"]}
+```
+
+This is useful wherever a URL has to be resolved back to the installation that
+serves it — a router in front of several TYPO3 instances, for example, or
+tooling that turns a pasted backend link into the right connection.
+
 ## Development
 
 ### Running Tests

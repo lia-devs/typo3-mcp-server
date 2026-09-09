@@ -26,6 +26,12 @@ services:
       - name: 'console.command'
         command: 'mcp:oauth'
         description: 'Manage OAuth tokens for MCP server'
+
+  Hn\McpServer\Command\DomainsCommand:
+    tags:
+      - name: 'console.command'
+        command: 'mcp:domains'
+        description: 'List all site domains (base + baseVariants) as JSON'
         
   # Make ToolRegistry public for eID access
   Hn\McpServer\MCP\ToolRegistry:

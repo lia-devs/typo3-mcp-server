@@ -120,19 +120,32 @@ class SiteInformationService
         foreach ($sites as $site) {
             $base = $site->getBase();
             $host = $base->getHost();
-            
-            // Add main domain if it's not empty and not just a path
-            if (!empty($host) && $host !== '/') {
+
+            // Add main domain if it's not empty and not just a path. Note:
+            // when a baseVariant condition matches the current application
+            // context, the Site entity already resolved getBase() to that
+            // variant — the configured main base then only exists in the
+            // raw configuration (collected below).
+            if ($this->isPlausibleHostname($host)) {
                 $domains[] = $host;
             }
-            
-            // Check if the site has base variants (method may not exist in all TYPO3 versions)
-            if (method_exists($site, 'getBaseVariants')) {
-                foreach ($site->getBaseVariants() ?? [] as $variant) {
-                    $variantHost = $variant->getBase()->getHost();
-                    if (!empty($variantHost) && $variantHost !== '/' && !in_array($variantHost, $domains)) {
-                        $domains[] = $variantHost;
-                    }
+
+            // The Site entity has no getter for base variants; they only
+            // exist in the raw site configuration. Collect the configured
+            // base and every baseVariant host so ALL domains the instance
+            // serves are listed, independent of the current context.
+            // Scheme-less bases yield no host from parse_url and are omitted;
+            // TYPO3's site handling requires a scheme (or a leading slash),
+            // so such entries are broken configuration, not real domains.
+            $configuration = $site->getConfiguration();
+            $configuredBases = array_merge(
+                [$configuration['base'] ?? ''],
+                array_column($configuration['baseVariants'] ?? [], 'base')
+            );
+            foreach ($configuredBases as $configuredBase) {
+                $configuredHost = (string)parse_url((string)$configuredBase, PHP_URL_HOST);
+                if ($this->isPlausibleHostname($configuredHost) && !in_array($configuredHost, $domains, true)) {
+                    $domains[] = $configuredHost;
                 }
             }
         }
@@ -146,6 +159,18 @@ class SiteInformationService
         }
 
         return array_unique($domains);
+    }
+
+    /**
+     * Whether a string is a syntactically plausible hostname. Site bases may
+     * carry unresolved %env(...)% placeholders (TYPO3 leaves the literal text
+     * in place when the variable is unset) — those must not surface as
+     * domains, because a consumer validating hosts with this rule would
+     * reject the whole output over one malformed entry.
+     */
+    protected function isPlausibleHostname(string $host): bool
+    {
+        return $host !== '' && preg_match('/^[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?$/', $host) === 1;
     }
 
     /**
