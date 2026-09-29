@@ -7,6 +7,7 @@ namespace Hn\McpServer\Controller;
 use Psr\Http\Message\ResponseInterface;
 use Psr\Http\Message\ServerRequestInterface;
 use TYPO3\CMS\Backend\Template\ModuleTemplateFactory;
+use TYPO3\CMS\Backend\Utility\BackendUtility;
 use TYPO3\CMS\Backend\Routing\UriBuilder;
 use TYPO3\CMS\Core\Authentication\BackendUserAuthentication;
 use TYPO3\CMS\Core\Database\ConnectionPool;
@@ -14,6 +15,7 @@ use TYPO3\CMS\Core\Utility\GeneralUtility;
 use TYPO3\CMS\Core\Page\PageRenderer;
 use TYPO3\CMS\Core\Http\JsonResponse;
 use TYPO3\CMS\Core\Http\HtmlResponse;
+use Hn\McpServer\Exception\WorkspaceConfigurationException;
 use Hn\McpServer\Http\RequestUrlTrait;
 use Hn\McpServer\MCP\ToolRegistry;
 use Hn\McpServer\Service\OAuthService;
@@ -78,6 +80,20 @@ class McpServerModuleController
         // Check if any workspace exists
         $hasWorkspace = $this->hasAnyWorkspace();
 
+        // Workspace the MCP tools of this user will work in, or why they refuse to run
+        $mcpWorkspaceTitle = null;
+        $workspaceProblem = null;
+        try {
+            $configuredWorkspaceId = $this->workspaceContextService->resolveConfiguredWorkspace($backendUser);
+            if ($configuredWorkspaceId === null) {
+                $this->workspaceContextService->ensureAutomaticSelectionAllowed($backendUser);
+            } else {
+                $mcpWorkspaceTitle = BackendUtility::getRecord('sys_workspace', $configuredWorkspaceId, 'title')['title'];
+            }
+        } catch (WorkspaceConfigurationException $e) {
+            $workspaceProblem = $e->getMessage();
+        }
+
         // Detect if the server is running on localhost
         $isLocalhost = $this->isLocalhostUrl($baseUrl);
 
@@ -100,6 +116,8 @@ class McpServerModuleController
             'userId' => $userId,
             'siteName' => $this->getSiteName(),
             'hasWorkspace' => $hasWorkspace,
+            'mcpWorkspaceTitle' => $mcpWorkspaceTitle,
+            'workspaceProblem' => $workspaceProblem,
             'isLocalhost' => $isLocalhost,
             'isSubdirectoryInstall' => $isSubdirectoryInstall,
             'wellKnownAuthServerUrl' => $wellKnownAuthServerUrl,

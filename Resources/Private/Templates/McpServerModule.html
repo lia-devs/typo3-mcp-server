@@ -17,15 +17,31 @@
                 </div>
                 <div class="card-body pb-0">
                     <!-- Warnings -->
-                    <f:if condition="!{hasWorkspace}">
-                        <div class="alert alert-warning mb-3">
-                            <h6><strong>No workspace configured</strong></h6>
-                            <p class="mb-0">
-                                All changes made through MCP are staged in a TYPO3 Workspace before publishing. One will be created automatically, but you should
-                                <a href="{createWorkspaceUrl}">create one manually</a>
-                                to control permissions and review workflow.
-                            </p>
-                        </div>
+                    <f:if condition="{workspaceProblem}">
+                        <f:then>
+                            <div class="alert alert-danger mb-3">
+                                <h6><strong>MCP tools are blocked</strong></h6>
+                                <p class="mb-0">{workspaceProblem}</p>
+                            </div>
+                        </f:then>
+                        <f:else if="{mcpWorkspaceTitle}">
+                            <div class="alert alert-info mb-3">
+                                <p class="mb-0">
+                                    All changes made through MCP are staged in the workspace <strong>{mcpWorkspaceTitle}</strong> before publishing.
+                                </p>
+                            </div>
+                        </f:else>
+                        <f:else if="!{hasWorkspace}">
+                            <div class="alert alert-warning mb-3">
+                                <h6><strong>No workspace configured</strong></h6>
+                                <p class="mb-0">
+                                    All changes made through MCP are staged in a TYPO3 Workspace before publishing. One will be created automatically, but you should
+                                    <a href="{createWorkspaceUrl}">create one manually</a>
+                                    and enter its title as "Default workspace title" in the mcp_server extension settings
+                                    to control permissions and review workflow.
+                                </p>
+                            </div>
+                        </f:else>
                     </f:if>
                     <f:if condition="{isLocalhost}">
                         <div class="alert alert-warning mb-3">

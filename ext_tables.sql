@@ -95,3 +95,10 @@ CREATE TABLE tx_mcpserver_upload_tokens (
 	UNIQUE KEY token (token),
 	KEY expires (expires)
 );
+
+#
+# Workspace in which MCP changes of this backend user are staged
+#
+CREATE TABLE be_users (
+	tx_mcpserver_workspace int(11) unsigned DEFAULT '0' NOT NULL
+);

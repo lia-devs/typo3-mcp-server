@@ -128,3 +128,15 @@ Our implementation is extensively tested in:
 ## Conclusion
 
 Our workspace transparency implementation provides a practical solution for exposing TYPO3 content to LLMs. By handling workspace complexity at the query level rather than through post-processing, we achieve true transparency while maintaining data integrity. This approach may differ from standard TYPO3 patterns, but it effectively meets the specific requirements of an LLM-focused API.
+## Workspace Selection
+
+`WorkspaceContextService::switchToOptimalWorkspace()` resolves the workspace on every request and again before every tool run:
+
+1. `be_users.tx_mcpserver_workspace`, if set and the workspace still exists. A deleted user workspace falls through to the default.
+2. The extension setting `defaultWorkspaceTitle`, if set. It is a title rather than a uid because `sys_workspace` records are created per environment with differing uids, while the extension settings are deployed unchanged. No or more than one workspace with that title throws.
+3. Automatic selection, if the extension setting `autoCreateWorkspace` is enabled (default): the workspace the user has currently selected in the backend (`be_users.workspace_id`), else the first writable workspace, else a newly created personal workspace.
+4. Otherwise a `WorkspaceConfigurationException` is thrown.
+
+A configured workspace (steps 1 and 2) also requires write access (`_ACCESS` admin, owner or member), otherwise a `WorkspaceConfigurationException` is thrown. There is no silent fallback, so changes never end up in a workspace other than the configured one.
+
+`McpEndpoint` catches the exception while setting up the request and continues in live, because the endpoint's catch-all would only answer with a bare HTTP 500. `AbstractRecordTool::initialize()` resolves the workspace again, and the exception becomes the tool's error result, which tells the user what an administrator has to change. The `McpServerModuleController` shows the effective workspace or the same message.

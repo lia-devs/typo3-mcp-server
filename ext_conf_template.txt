@@ -6,3 +6,9 @@ additionalStandaloneTables = sys_file_metadata
 
 # cat=mcp/files; type=int+; label=Maximum file size (MiB): Upper limit for files fetched from URLs or received through pre-signed uploads via the UploadFile tool. Default: 500
 maxFileSizeMb = 500
+
+# cat=mcp/workspace; type=string; label=Default workspace title: Title of the workspace in which all MCP changes are staged, for every backend user who has no workspace selected in the "MCP workspace" field of their user record. A user workspace that has been deleted also falls back to this one. Referenced by title because workspace uids differ between environments. The user needs write access (owner or member) to the workspace. Empty = no default workspace.
+defaultWorkspaceTitle =
+
+# cat=mcp/workspace; type=boolean; label=Select workspace automatically: Applies only when neither the user record nor "Default workspace title" names a workspace. Enabled: use the workspace currently selected in the backend, else the first writable one, else create a personal "MCP Workspace for <user>". Disabled: MCP tools refuse to run and tell the user to ask an administrator for a workspace.
+autoCreateWorkspace = 1

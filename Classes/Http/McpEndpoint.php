@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Hn\McpServer\Http;
 
+use Hn\McpServer\Exception\WorkspaceConfigurationException;
 use Hn\McpServer\MCP\McpServerFactory;
 use Hn\McpServer\Service\BackendUserContextService;
 use Hn\McpServer\Service\OAuthService;
@@ -310,9 +311,17 @@ class McpEndpoint
         $beUser = $userContext->impersonate($userId);
 
         // Pick the workspace the MCP tools work in and keep the Context aspect
-        // in sync with it.
+        // in sync with it. A missing workspace configuration must not fail the
+        // whole request: the catch-all in __invoke() would answer with a bare 500 that
+        // clients only show as "connection failed". Every tool resolves the
+        // workspace again before it runs and reports the reason as its result.
         $workspaceService = GeneralUtility::makeInstance(WorkspaceContextService::class);
-        $workspaceId = $workspaceService->switchToOptimalWorkspace($beUser);
+        try {
+            $workspaceId = $workspaceService->switchToOptimalWorkspace($beUser);
+        } catch (WorkspaceConfigurationException $e) {
+            $this->logDebug('MCP: ' . $e->getMessage());
+            $workspaceId = 0;
+        }
         $userContext->updateWorkspaceAspect($workspaceId);
 
         // Set up TYPO3 Context API (following BackendUserAuthenticator pattern)

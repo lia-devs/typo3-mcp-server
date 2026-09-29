@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8" standalone="yes" ?>
+<xliff version="1.0">
+	<file source-language="en" datatype="plaintext" original="messages" date="2026-09-28T12:00:00Z" product-name="mcp_server">
+		<header/>
+		<body>
+			<trans-unit id="be_users.tx_mcpserver_workspace">
+				<source>MCP workspace</source>
+			</trans-unit>
+			<trans-unit id="be_users.tx_mcpserver_workspace.description">
+				<source>Workspace in which changes made through the MCP server are staged. The user needs write access (owner or member) to it. If the selected workspace is deleted, the default workspace from the mcp_server extension settings is used.</source>
+			</trans-unit>
+			<trans-unit id="be_users.tx_mcpserver_workspace.default">
+				<source>Default workspace from extension settings</source>
+			</trans-unit>
+		</body>
+	</file>
+</xliff>

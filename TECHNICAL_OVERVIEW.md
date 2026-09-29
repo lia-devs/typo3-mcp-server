@@ -308,7 +308,7 @@ Example:
 
 Behind the scenes, the workspace system:
 
-1. **Finds or creates** an appropriate workspace
+1. **Resolves** the configured workspace (per user or default), or finds or creates one if none is configured
 2. **Manages versions** without exposing version UIDs
 3. **Handles deletes** through delete placeholders
 4. **Overlays data** for transparent reading
@@ -341,7 +341,7 @@ The MCP Server respects all TYPO3 permissions:
 - **Table permissions**: Based on user group
 - **Field permissions**: Exclude fields work
 - **Record permissions**: Custom access checks
-- **Workspace permissions**: Automatic workspace selection
+- **Workspace permissions**: Configured workspace (per user or default) with write access check, automatic selection as fallback
 
 ## What's Not Yet Implemented
 

@@ -4,9 +4,12 @@ declare(strict_types=1);
 
 namespace Hn\McpServer\Service;
 
+use Hn\McpServer\Exception\WorkspaceConfigurationException;
 use TYPO3\CMS\Core\Authentication\BackendUserAuthentication;
+use TYPO3\CMS\Core\Configuration\ExtensionConfiguration;
 use TYPO3\CMS\Core\Context\Context;
 use TYPO3\CMS\Core\Context\WorkspaceAspect;
+use TYPO3\CMS\Core\Database\Connection;
 use TYPO3\CMS\Core\Database\ConnectionPool;
 use TYPO3\CMS\Core\DataHandling\DataHandler;
 use TYPO3\CMS\Core\Utility\GeneralUtility;
@@ -17,32 +20,155 @@ use TYPO3\CMS\Workspaces\Service\WorkspaceService;
  */
 class WorkspaceContextService
 {
+    public const USER_WORKSPACE_FIELD = 'tx_mcpserver_workspace';
+
     /**
-     * Switch to the optimal workspace for the current user.
-     * Creates a new workspace if none exists and user can create workspaces.
+     * Switch to the workspace the MCP tools work in.
+     *
+     * A configured workspace wins: the user's own (be_users.tx_mcpserver_workspace),
+     * then the extension setting defaultWorkspaceTitle. Only when neither is
+     * configured does the automatic selection run, and only if the extension
+     * setting autoCreateWorkspace allows it.
+     *
+     * @throws WorkspaceConfigurationException When no usable workspace is configured
      */
     public function switchToOptimalWorkspace(BackendUserAuthentication $beUser): int
     {
-        // If already in a workspace, don't switch
+        $workspaceId = $this->resolveConfiguredWorkspace($beUser)
+            ?? $this->selectWorkspaceAutomatically($beUser);
+
+        $this->setWorkspaceContext($beUser, $workspaceId);
+
+        return $workspaceId;
+    }
+
+    /**
+     * The user's workspace, or the default workspace when the user has none or
+     * the user's workspace was deleted. Null when neither is configured.
+     *
+     * @throws WorkspaceConfigurationException
+     */
+    public function resolveConfiguredWorkspace(BackendUserAuthentication $beUser): ?int
+    {
+        $userWorkspaceId = (int)($beUser->user[self::USER_WORKSPACE_FIELD] ?? 0);
+        if ($userWorkspaceId > 0 && $this->workspaceExists($userWorkspaceId)) {
+            return $this->ensureWriteAccess($beUser, $userWorkspaceId);
+        }
+
+        $defaultWorkspaceTitle = trim((string)GeneralUtility::makeInstance(ExtensionConfiguration::class)
+            ->get('mcp_server', 'defaultWorkspaceTitle'));
+        if ($defaultWorkspaceTitle === '') {
+            return null;
+        }
+
+        return $this->ensureWriteAccess($beUser, $this->findWorkspaceByTitle($defaultWorkspaceTitle));
+    }
+
+    /**
+     * The default workspace is referenced by title rather than uid, because
+     * sys_workspace records are created per environment and their uids differ,
+     * while the extension settings are deployed unchanged to every environment.
+     *
+     * @throws WorkspaceConfigurationException When no or more than one workspace has this title
+     */
+    protected function findWorkspaceByTitle(string $title): int
+    {
+        $queryBuilder = GeneralUtility::makeInstance(ConnectionPool::class)
+            ->getQueryBuilderForTable('sys_workspace');
+        $workspaceUids = $queryBuilder
+            ->select('uid')
+            ->from('sys_workspace')
+            ->where($queryBuilder->expr()->eq('title', $queryBuilder->createNamedParameter($title)))
+            ->executeQuery()
+            ->fetchFirstColumn();
+
+        if (count($workspaceUids) !== 1) {
+            throw new WorkspaceConfigurationException(sprintf(
+                '%s workspace is titled "%s", so the default MCP workspace is ambiguous or missing. Ask an'
+                . ' administrator to update "defaultWorkspaceTitle" in the mcp_server extension settings.',
+                $workspaceUids === [] ? 'No' : 'More than one',
+                $title
+            ));
+        }
+
+        return (int)$workspaceUids[0];
+    }
+
+    /**
+     * Automatic selection for installations without a configured workspace:
+     * the workspace currently selected in the backend, the first writable one,
+     * or a newly created personal workspace.
+     *
+     * @throws WorkspaceConfigurationException When autoCreateWorkspace is disabled
+     */
+    protected function selectWorkspaceAutomatically(BackendUserAuthentication $beUser): int
+    {
+        $this->ensureAutomaticSelectionAllowed($beUser);
+
         $currentWorkspace = $beUser->workspace ?? 0;
         if ($currentWorkspace > 0) {
             return $currentWorkspace;
         }
-        
-        // First check if user already has access to workspaces
+
         $workspaceId = $this->getFirstWritableWorkspace($beUser);
-        
-        // If no workspace found and user can create workspaces, create one
         if ($workspaceId === 0 && $this->canUserCreateWorkspaces($beUser)) {
             $workspaceId = $this->createMcpWorkspace($beUser);
         }
-        
-        // Set the workspace context
-        $this->setWorkspaceContext($beUser, $workspaceId);
-        
+
         return $workspaceId;
     }
-    
+
+    /**
+     * @throws WorkspaceConfigurationException When autoCreateWorkspace is disabled
+     */
+    public function ensureAutomaticSelectionAllowed(BackendUserAuthentication $beUser): void
+    {
+        $autoCreateWorkspace = (bool)GeneralUtility::makeInstance(ExtensionConfiguration::class)
+            ->get('mcp_server', 'autoCreateWorkspace');
+        if (!$autoCreateWorkspace) {
+            throw new WorkspaceConfigurationException(sprintf(
+                'No MCP workspace is configured for backend user "%s". Ask an administrator to select'
+                . ' a workspace in the user record or to set "defaultWorkspaceTitle" in the mcp_server'
+                . ' extension settings.',
+                $beUser->user['username']
+            ));
+        }
+    }
+
+    protected function workspaceExists(int $workspaceId): bool
+    {
+        $queryBuilder = GeneralUtility::makeInstance(ConnectionPool::class)
+            ->getQueryBuilderForTable('sys_workspace');
+
+        return (int)$queryBuilder
+            ->count('uid')
+            ->from('sys_workspace')
+            ->where($queryBuilder->expr()->eq(
+                'uid',
+                $queryBuilder->createNamedParameter($workspaceId, Connection::PARAM_INT)
+            ))
+            ->executeQuery()
+            ->fetchOne() > 0;
+    }
+
+    /**
+     * @throws WorkspaceConfigurationException When the user may not write to the workspace
+     */
+    protected function ensureWriteAccess(BackendUserAuthentication $beUser, int $workspaceId): int
+    {
+        $workspaceRecord = $beUser->checkWorkspace($workspaceId);
+        if ($workspaceRecord === false || !$this->hasWriteAccess($workspaceRecord)) {
+            throw new WorkspaceConfigurationException(sprintf(
+                'Backend user "%s" has no write access to the MCP workspace (uid %d). Ask an administrator'
+                . ' to add the user as owner or member of that workspace.',
+                $beUser->user['username'],
+                $workspaceId
+            ));
+        }
+
+        return $workspaceId;
+    }
+
     /**
      * Get the first workspace the user can write to
      */

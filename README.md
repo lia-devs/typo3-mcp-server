@@ -60,7 +60,7 @@ All these operations happen safely in workspaces, giving you full control to rev
 | **Content Translation**         | ⚠️ Experimental | Implemented, needs real-world testing |
 | **File Upload**                 | ✅ Ready         | From a URL, a YouTube/Vimeo link, raw text content, or a local file via single-use upload URL. Create-only: never overwrites or deletes, identical content is detected, executable files are refused |
 | **File Discovery & References** | ⚠️ Partial      | Browse `sys_file` and metadata within the user's file mounts (incl. public URLs), edit metadata, create file references. No visual or semantic image search yet |
-| **Workspace Selection**         | ❌ Missing       | Currently uses the first writable workspace of the user |
+| **Workspace Selection**         | ✅ Ready         | Default workspace in the extension configuration, overridable per backend user. Falls back to automatic selection when nothing is configured (can be switched off) |
 
 While there are a lot of automated tests, TYPO3 instances are widely different and Language Models are also widely different. Feel free to [create issues here on GitHub](https://github.com/logiscape/mcp-sdk-php/issues) or [share experiences in the typo3-core-ai channel](https://typo3.slack.com/archives/C091M0M7BL6). 
 
@@ -99,6 +99,23 @@ The defaults work out of the box. All settings live in the extension configurati
 | `maxFileSizeMb`              | `500`               | Upper limit in MiB for files fetched from a URL or received through an upload link |
 | `additionalReadOnlyTables`   | `sys_file`          | Non-workspace-capable tables exposed read-only — this is what lets the AI browse your files |
 | `additionalStandaloneTables` | `sys_file_metadata` | `hideTable` tables exposed as independent tables — this is what makes file metadata such as titles and alt texts editable |
+| `defaultWorkspaceTitle`      | *(empty)*           | Title of the workspace in which MCP changes are staged for every user without an own MCP workspace. A title because workspace uids differ between environments. Empty = none |
+| `autoCreateWorkspace`        | `1`                 | Without a configured workspace: pick the user's current or first writable workspace, or create one. `0` = refuse to run instead |
+
+#### Workspace selection
+
+All MCP changes are staged in exactly one workspace per backend user, resolved on every request:
+
+1. The workspace selected in the user record (**Backend Users → user → MCP workspace**), unless it has been deleted.
+2. Otherwise the workspace titled `defaultWorkspaceTitle`. If no or more than one workspace has this title, MCP tools refuse to run.
+3. Otherwise, with `autoCreateWorkspace = 1`, the automatic selection: the workspace the user currently has selected in the backend, else the first writable one, else a newly created "MCP Workspace for &lt;user&gt;".
+4. Otherwise MCP tools refuse to run.
+
+The user needs write access (owner or member) to the resolved workspace, otherwise MCP tools refuse to run as well.
+Refusing tools report the reason as their result, so the AI assistant can tell the user what an administrator has to change.
+The **MCP Server** backend module shows which workspace is in effect for the current user.
+
+For a deterministic setup, create a workspace in every environment with the same title, set that title as `defaultWorkspaceTitle` and set `autoCreateWorkspace = 0`.
 
 ## Usage
 
