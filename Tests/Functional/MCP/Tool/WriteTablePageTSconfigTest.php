@@ -7,6 +7,7 @@ namespace Hn\McpServer\Tests\Functional\MCP\Tool;
 use Hn\McpServer\MCP\Tool\Record\ReadTableTool;
 use Hn\McpServer\MCP\Tool\Record\WriteTableTool;
 use Hn\McpServer\Tests\Functional\AbstractFunctionalTest;
+use PHPUnit\Framework\Attributes\Test;
 use TYPO3\CMS\Core\Core\Environment;
 use TYPO3\CMS\Core\Utility\GeneralUtility;
 
@@ -106,6 +107,41 @@ class WriteTablePageTSconfigTest extends AbstractFunctionalTest
 
         $this->assertTrue($result->isError, json_encode($result->jsonSerialize()));
         $this->assertStringContainsString('nav_title', $result->content[0]->text);
+    }
+
+    /**
+     * search_replace checks field access on its own, before any field content is
+     * read, and has to resolve it at the same page as a plain update.
+     */
+    #[Test]
+    public function searchReplaceOnAFieldReEnabledOnTheEditedPageIsWritable(): void
+    {
+        $result = (new WriteTableTool())->execute([
+            'action' => 'update',
+            'table' => 'pages',
+            'uid' => 2,
+            'data' => ['nav_title' => [['search' => 'Us', 'replace' => 'us']]],
+        ]);
+
+        $this->assertFalse($result->isError, json_encode($result->jsonSerialize()));
+    }
+
+    /**
+     * Rejected as inaccessible, not with "not found", which would disclose whether
+     * the disabled field contains the search string.
+     */
+    #[Test]
+    public function searchReplaceOnAFieldThatOnlyInheritsTheDisableIsRejected(): void
+    {
+        $result = (new WriteTableTool())->execute([
+            'action' => 'update',
+            'table' => 'pages',
+            'uid' => 3,
+            'data' => ['nav_title' => [['search' => 'anything', 'replace' => 'else']]],
+        ]);
+
+        $this->assertTrue($result->isError, json_encode($result->jsonSerialize()));
+        $this->assertSame("Invalid input: Field 'nav_title' is not accessible", $result->content[0]->text);
     }
 
     /**

@@ -317,7 +317,7 @@ class WriteTableTool extends AbstractRecordTool
         }
 
         // Ensure language field is set for language-aware tables (needed for non-admin permission checks)
-        $data = $this->ensureLanguageField($table, $data);
+        $data = $this->ensureLanguageField($table, $data, $pid);
 
         // Pre-validate authMode permissions (e.g., CType values) for non-admin users
         $authModeError = $this->validateAuthModePermissions($table, $data);
@@ -1869,15 +1869,34 @@ class WriteTableTool extends AbstractRecordTool
         // Collect all field names we need to fetch
         $fieldNames = array_keys($searchReplace);
 
-        // Validate all fields exist, are accessible, and are string-type before fetching the record.
-        // Field access MUST be checked before any DB read to prevent information disclosure
+        // TCEFORM visibility is resolved at the same page and record type as in
+        // validateRecordData(): a page record at itself, anything else at the page it
+        // lives on. Only the location and type are read here, no field content. (#120)
+        $typeField = $this->tableAccessService->getTypeFieldName($table);
+        $contextRecord = BackendUtility::getRecord(
+            $table,
+            $uid,
+            'uid,pid,t3ver_oid,t3ver_state' . ($typeField !== null ? ',' . $typeField : '')
+        );
+        if ($contextRecord !== null) {
+            BackendUtility::workspaceOL($table, $contextRecord);
+        }
+        $tsConfigPid = null;
+        $recordType = '';
+        if (is_array($contextRecord)) {
+            $tsConfigPid = $table === 'pages' ? $uid : (int)$contextRecord['pid'];
+            $recordType = $typeField !== null ? (string)($contextRecord[$typeField] ?? '') : '';
+        }
+
+        // Validate all fields exist, are accessible, and are string-type before reading any
+        // field content. Field access MUST be checked first to prevent information disclosure
         // via search/replace error messages ("not found" / "found N times").
         foreach ($fieldNames as $fieldName) {
             $fieldConfig = $this->tableAccessService->getFieldConfig($table, $fieldName);
             if (!$fieldConfig) {
                 throw new ValidationException(["search_replace field '{$fieldName}' does not exist in table '{$table}'"]);
             }
-            if (!$this->tableAccessService->canAccessField($table, $fieldName)) {
+            if (!$this->tableAccessService->canAccessField($table, $fieldName, $recordType, $tsConfigPid)) {
                 throw new ValidationException(["Field '{$fieldName}' is not accessible"]);
             }
             $fieldType = $fieldConfig['config']['type'] ?? '';
@@ -2141,9 +2160,10 @@ class WriteTableTool extends AbstractRecordTool
      *
      * @param string $table Table name
      * @param array $data Record data
+     * @param int $pid Page the record is created on, whose TSconfig decides field visibility
      * @return array Modified data with sys_language_uid if needed
      */
-    protected function ensureLanguageField(string $table, array $data): array
+    protected function ensureLanguageField(string $table, array $data, int $pid): array
     {
         // Only modify data for non-admin users who need this for permission checks
         $beUser = $GLOBALS['BE_USER'];
@@ -2171,7 +2191,7 @@ class WriteTableTool extends AbstractRecordTool
         }
 
         // Check if the language field is actually available for this record type
-        if (!$this->tableAccessService->canAccessField($table, $languageField, $type)) {
+        if (!$this->tableAccessService->canAccessField($table, $languageField, $type, $pid)) {
             // Language field is not available for this type, don't add it
             return $data;
         }
