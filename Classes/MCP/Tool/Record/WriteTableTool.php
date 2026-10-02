@@ -897,15 +897,25 @@ class WriteTableTool extends AbstractRecordTool
         // Build a record context for dynamic select-item resolution. TSconfig- and
         // backend-layout-driven items (e.g. tt_content.colPos, CType disableCTypes) only
         // resolve correctly when the target pid and sibling field values are known.
+        // An update starts from the stored record, so siblings the call does not
+        // touch still count.
         $recordContext = [];
-        if ($pid !== null) {
-            $recordContext['pid'] = $pid;
+        if ($action === 'update' && $uid !== null) {
+            $recordContext = BackendUtility::getRecord($table, $uid) ?? [];
         }
         foreach ($data as $contextKey => $contextValue) {
             if (!is_array($contextValue)) {
                 $recordContext[$contextKey] = $contextValue;
             }
         }
+        if ($pid !== null) {
+            $recordContext['pid'] = $pid;
+        }
+
+        // Page whose TSconfig decides field visibility (TCEFORM.<table>.<field>.disabled):
+        // the page the record lives on. Without it, canAccessField() falls back to the
+        // first site root and misses every TSconfig condition below it (#87).
+        $tsConfigPid = isset($recordContext['pid']) ? (int)$recordContext['pid'] : null;
 
         // TYPO3 control fields have no TCA columns entry but are still writable
         // (DataHandler handles them). Allow them so the "unknown field" guard below
@@ -939,7 +949,7 @@ class WriteTableTool extends AbstractRecordTool
             }
 
             // Check if field is accessible (filters out inaccessible inline relations)
-            if (!$this->tableAccessService->canAccessField($table, $fieldName)) {
+            if (!$this->tableAccessService->canAccessField($table, $fieldName, '', $tsConfigPid)) {
                 return "Field '{$fieldName}' is not accessible";
             }
 
