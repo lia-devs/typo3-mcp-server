@@ -159,6 +159,33 @@ Build/runTests.sh -h
 
 Tools are defined in the `Classes/MCP/Tool` directory. Each tool follows the MCP tool specification and maps to specific TYPO3 functionality.
 
+### Restricting Tool Calls from Other Extensions
+
+Every tool call dispatches the PSR-14 event `Hn\McpServer\Event\BeforeToolCallEvent` before the tool
+does anything. A listener sees the tool name and the arguments of the call and can veto it; the client
+then gets an error result with the reason, the tool itself never runs. The backend user of the call is
+available through the TYPO3 Context API.
+
+```php
+use Hn\McpServer\Event\BeforeToolCallEvent;
+use TYPO3\CMS\Core\Attribute\AsEventListener;
+
+#[AsEventListener('my-extension/mcp-no-uploads')]
+final class DenyUploadsListener
+{
+    public function __invoke(BeforeToolCallEvent $event): void
+    {
+        if ($event->getToolName() === 'UploadFile') {
+            $event->veto('Uploads are handled by the editors of this site');
+        }
+    }
+}
+```
+
+The arguments are the raw ones of the respective tool. To protect data no matter how it is reached,
+prefer the layer that owns it (for files: FAL, e.g. a driver or `Before*` resource events; for records:
+`BeforeRecordReadEvent` / `BeforeRecordWriteEvent`).
+
 ## Learn More
 
 - 📖 **[Technical Overview](TECHNICAL_OVERVIEW.md)** - Comprehensive guide covering architecture, implementation details, and advanced usage

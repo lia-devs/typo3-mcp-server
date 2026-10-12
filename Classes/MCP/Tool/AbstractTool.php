@@ -4,9 +4,12 @@ declare(strict_types=1);
 
 namespace Hn\McpServer\MCP\Tool;
 
+use Hn\McpServer\Event\BeforeToolCallEvent;
 use Hn\McpServer\Traits\ExceptionHandlerTrait;
 use Mcp\Types\CallToolResult;
 use Mcp\Types\TextContent;
+use Psr\EventDispatcher\EventDispatcherInterface;
+use TYPO3\CMS\Core\Utility\GeneralUtility;
 
 /**
  * Abstract base class for MCP tools
@@ -40,6 +43,13 @@ abstract class AbstractTool implements ToolInterface
     final public function execute(array $params): CallToolResult
     {
         try {
+            // Let other extensions veto the call before the tool touches anything
+            $beforeEvent = GeneralUtility::makeInstance(EventDispatcherInterface::class)
+                ->dispatch(new BeforeToolCallEvent($this->getName(), $params));
+            if ($beforeEvent->isVetoed()) {
+                return $this->createErrorResult('Tool call vetoed: ' . ($beforeEvent->getVetoReason() ?? 'No reason given'));
+            }
+
             // Initialize any necessary context (overridden in subclasses)
             $this->initialize();
             
