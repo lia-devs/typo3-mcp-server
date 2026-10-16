@@ -133,6 +133,14 @@ This method gives you admin privileges by default. Add this to your mcp config f
 }
 ```
 
+The client keeps this process running for the whole session, while TYPO3 takes
+its request time (`$GLOBALS['EXEC_TIME']`, `ACCESS_TIME`, `SIM_EXEC_TIME`,
+`SIM_ACCESS_TIME` and the Context's `date` aspect) once when a process starts.
+The server therefore resets the request time to the current time before every
+tool call. Each call gets its own `tstamp`/`crdate`, `sys_log` and
+`sys_history` time, and `starttime`/`endtime` checks use the time of the call,
+as they would in a separate web request.
+
 ## Development
 
 ### Running Tests
