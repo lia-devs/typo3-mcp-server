@@ -610,7 +610,7 @@ class ReadTableTool extends AbstractRecordTool
             // ("persistence.storagePid" => {"persistence": {"storagePid":
             // ...}}) — symmetric to what WriteTable accepts as input.
             $flexFormService = GeneralUtility::makeInstance(FlexFormService::class);
-            return $flexFormService->convertFlexFormContentToArray($value);
+            return $this->listFlexFormSectionItems($parsed, $flexFormService->convertFlexFormContentToArray($value));
         }
 
         // Convert JSON strings to arrays
@@ -632,6 +632,44 @@ class ReadTableTool extends AbstractRecordTool
         }
 
         return $value;
+    }
+
+    /**
+     * Turn the items of every FlexForm section into a JSON list.
+     *
+     * FlexFormService keys section items by their stored ids — random strings
+     * that mean nothing to a client. WriteTable takes a section as a list and
+     * assigns the ids itself, so the items are listed here in stored order:
+     * what ReadTable returns, WriteTable accepts. A stored section is a lDEF
+     * node holding `el` instead of `vDEF`.
+     *
+     * @param array<string, mixed> $parsedXml the stored value as parsed by xml2array()
+     * @param array<string, mixed> $converted the same value converted by FlexFormService
+     * @return array<string, mixed>
+     */
+    protected function listFlexFormSectionItems(array $parsedXml, array $converted): array
+    {
+        foreach (($parsedXml['data'] ?? []) as $languages) {
+            if (!is_array($languages['lDEF'] ?? false)) {
+                continue;
+            }
+            foreach ($languages['lDEF'] as $fieldName => $node) {
+                if (!is_array($node) || !array_key_exists('el', $node)) {
+                    continue;
+                }
+                // FlexFormService nests dotted field names, so the section
+                // sits at the path its name spells out
+                $items = &$converted;
+                foreach (explode('.', (string)$fieldName) as $pathSegment) {
+                    $items = &$items[$pathSegment];
+                }
+                // A section without items is stored as an empty `el`
+                $items = is_array($items) ? array_values($items) : [];
+                unset($items);
+            }
+        }
+
+        return $converted;
     }
 
     /**

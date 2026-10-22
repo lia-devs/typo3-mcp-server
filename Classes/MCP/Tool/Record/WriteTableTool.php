@@ -18,6 +18,7 @@ use TYPO3\CMS\Backend\Utility\BackendUtility;
 use TYPO3\CMS\Core\DataHandling\DataHandler;
 use TYPO3\CMS\Core\Configuration\FlexForm\FlexFormTools;
 use TYPO3\CMS\Core\Utility\GeneralUtility;
+use TYPO3\CMS\Core\Utility\StringUtility;
 use TYPO3\CMS\Core\Database\ConnectionPool;
 use TYPO3\CMS\Core\Database\Query\Restriction\DeletedRestriction;
 use TYPO3\CMS\Core\Database\Query\Restriction\WorkspaceRestriction;
@@ -97,6 +98,7 @@ class WriteTableTool extends AbstractRecordTool
                             'FLEXFORM (e.g. pi_flexform): Pass a nested JSON object, e.g. {"settings": {"orderBy": "datetime"}, "persistence": {"storagePid": "12"}} — the conversion to the stored XML happens for you. ' .
                             'PARTIAL PATCH: omitted fields keep their stored values, so send only what changes. Each field must be declared by the record type\'s DataStructure and is placed in its own sheet automatically; ' .
                             'call GetFlexFormSchema first, because unknown fields and fields declared in several sheets are rejected with the list of valid names. ' .
+                            'SECTIONS (repeatable lists, e.g. form finisher recipients) take a JSON list of items that REPLACES all stored items — send the complete list, [] removes all; GetFlexFormSchema shows the item shape. ' .
                             'NEVER pass FlexForm XML: a string starting with <?xml is stored verbatim, which skips both the merge and the schema check and DELETES every FlexForm value the string omits — with no error, reported as success. ' .
                             'ReadTable returns exactly the JSON shape to send back.',
                         'additionalProperties' => true,
@@ -1448,17 +1450,22 @@ class WriteTableTool extends AbstractRecordTool
      *
      * TYPO3's Extbase plugin settings reader builds a nested array from
      * dot-separated FlexForm field names, so every leaf must be written as
-     * its own "settings.a.b.c" field — not as a nested XML sub-tree.
+     * its own "settings.a.b.c" field — not as a nested XML sub-tree. Sections
+     * are the exception: their item list stays one value under the section's
+     * field name.
      *
-     * @return array<string, scalar|null>
+     * @param array<string, mixed> $sectionContainers see FlexFormStructureService::getSectionContainers()
+     * @return array<string, mixed>
      */
-    protected function flattenFlexFormSettings(array $data, string $prefix): array
+    protected function flattenFlexFormSettings(array $data, string $prefix, array $sectionContainers): array
     {
         $flat = [];
         foreach ($data as $key => $value) {
             $path = $prefix . '.' . $key;
-            if (is_array($value)) {
-                $flat += $this->flattenFlexFormSettings($value, $path);
+            // A section's item list is one field value — flattening it would
+            // turn every item subfield into a bogus field name
+            if (is_array($value) && !isset($sectionContainers[$path])) {
+                $flat += $this->flattenFlexFormSettings($value, $path, $sectionContainers);
             } else {
                 $flat[$path] = $value;
             }
@@ -1765,12 +1772,13 @@ class WriteTableTool extends AbstractRecordTool
             ]);
         }
         $fieldSheetMap = $structureService->getFieldSheetMap($structure);
+        $sectionContainers = $structureService->getSectionContainers($structure);
 
         // Validate the incoming fields against the DataStructure before merging
         $incomingValues = [];
         foreach ($value as $key => $subValue) {
-            if (is_array($subValue)) {
-                $incomingValues += $this->flattenFlexFormSettings($subValue, (string)$key);
+            if (is_array($subValue) && !isset($sectionContainers[(string)$key])) {
+                $incomingValues += $this->flattenFlexFormSettings($subValue, (string)$key, $sectionContainers);
             } else {
                 $incomingValues[(string)$key] = $subValue;
             }
@@ -1790,17 +1798,34 @@ class WriteTableTool extends AbstractRecordTool
             }
         }
 
-        // Merge: current values first (fields known to the DataStructure are
-        // re-placed into their canonical sheet, which also heals values older
-        // tool versions wrote into sDEF unconditionally; unknown leftovers
-        // keep their stored sheet), then the incoming values overlay.
-        $flexFormData = ['data' => []];
-        foreach ($this->extractFlexFormValues($table, $fieldName, $currentXml) as $flatKey => $current) {
-            $sheetKey = $fieldSheetMap[$flatKey][0] ?? $current['sheet'];
-            $flexFormData['data'][$sheetKey]['lDEF'][$flatKey]['vDEF'] = $current['value'];
+        // Build every incoming node before touching the stored value, so a
+        // rejected section item leaves the record unchanged
+        $currentNodes = $this->extractFlexFormNodes($table, $fieldName, $currentXml);
+        $incomingNodes = [];
+        foreach ($incomingValues as $flatKey => $incomingValue) {
+            $incomingNodes[$flatKey] = isset($sectionContainers[$flatKey])
+                ? $this->buildSectionNode(
+                    "$table.$fieldName",
+                    $flatKey,
+                    $incomingValue,
+                    $sectionContainers[$flatKey],
+                    $currentNodes[$flatKey]['node'] ?? []
+                )
+                : ['vDEF' => $incomingValue];
         }
-        foreach ($incomingValues as $flatKey => $leafValue) {
-            $flexFormData['data'][$fieldSheetMap[$flatKey][0]]['lDEF'][$flatKey]['vDEF'] = $leafValue;
+
+        // Merge: current nodes first, carried over as stored — sections
+        // included (fields known to the DataStructure are re-placed into their
+        // canonical sheet, which also heals values older tool versions wrote
+        // into sDEF unconditionally; unknown leftovers keep their stored
+        // sheet), then the incoming nodes replace theirs.
+        $flexFormData = ['data' => []];
+        foreach ($currentNodes as $flatKey => $current) {
+            $sheetKey = $fieldSheetMap[$flatKey][0] ?? $current['sheet'];
+            $flexFormData['data'][$sheetKey]['lDEF'][$flatKey] = $current['node'];
+        }
+        foreach ($incomingNodes as $flatKey => $node) {
+            $flexFormData['data'][$fieldSheetMap[$flatKey][0]]['lDEF'][$flatKey] = $node;
         }
 
         if ($flexFormData['data'] === []) {
@@ -1817,16 +1842,20 @@ class WriteTableTool extends AbstractRecordTool
     }
 
     /**
-     * Extract the stored FlexForm values of a record as a flat map of
-     * dotted field name => ['sheet' => sheet key, 'value' => stored value].
+     * Extract the stored FlexForm nodes of a record as a flat map of
+     * dotted field name => ['sheet' => sheet key, 'node' => stored node].
+     *
+     * A node is carried over whole: `['vDEF' => value]` for a plain field,
+     * `['el' => [item id => ...]]` for a section. Keeping only `vDEF` nodes
+     * erased every section on each partial patch.
      *
      * When the same field name appears in several sheets (older tool versions
      * wrote every field into sDEF), the last occurrence wins — matching the
      * read side, where FlexFormService flattens sheets in order.
      *
-     * @return array<string, array{sheet: string, value: mixed}>
+     * @return array<string, array{sheet: string, node: array<string, mixed>}>
      */
-    protected function extractFlexFormValues(string $table, string $fieldName, string $currentXml): array
+    protected function extractFlexFormNodes(string $table, string $fieldName, string $currentXml): array
     {
         if ($currentXml === '') {
             return [];
@@ -1844,7 +1873,7 @@ class WriteTableTool extends AbstractRecordTool
             ]);
         }
 
-        $values = [];
+        $nodes = [];
         foreach (($parsed['data'] ?? []) as $sheetKey => $languages) {
             // A sheet without fields is parsed as 'lDEF' => '' (empty string,
             // not an array) by xml2array — same guard as TYPO3 core's
@@ -1852,17 +1881,108 @@ class WriteTableTool extends AbstractRecordTool
             if (!is_array($languages['lDEF'] ?? false)) {
                 continue;
             }
-            foreach ($languages['lDEF'] as $flatKey => $valueContainer) {
-                if (is_array($valueContainer) && array_key_exists('vDEF', $valueContainer)) {
-                    $values[(string)$flatKey] = [
+            foreach ($languages['lDEF'] as $flatKey => $node) {
+                if (is_array($node)) {
+                    $nodes[(string)$flatKey] = [
                         'sheet' => (string)$sheetKey,
-                        'value' => $valueContainer['vDEF'],
+                        'node' => $node,
                     ];
                 }
             }
         }
 
-        return $values;
+        return $nodes;
+    }
+
+    /**
+     * Build the stored node of a FlexForm section from its JSON form: a list
+     * of items, in the shape ReadTable returns them. An item is
+     * {"<container>": {"<subfield>": value}}, or {"<subfield>": value} when
+     * the section's only container is `_arrayContainer` (ext:form).
+     *
+     * The list replaces the stored items completely and in the given order.
+     * Item ids mean nothing to the client, so the stored ids are reused by
+     * position — the workspace diff then shows only the items that changed —
+     * and additional items get new ids.
+     *
+     * @param array<string, array<string, mixed>> $containers container name => subfield name => subfield config
+     * @param array<string, mixed> $currentNode stored node of the section, [] when there is none
+     * @return array{el: array<string, array<string, mixed>>}
+     */
+    protected function buildSectionNode(
+        string $location,
+        string $sectionKey,
+        mixed $items,
+        array $containers,
+        array $currentNode
+    ): array {
+        $structureService = GeneralUtility::makeInstance(FlexFormStructureService::class);
+        $omitsContainerName = $structureService->itemsOmitTheContainerName($containers);
+        $section = "FlexForm section \"$sectionKey\" of $location";
+
+        if (!is_array($items) || !array_is_list($items)) {
+            throw new ValidationException([
+                "$section must be a JSON list of items, each "
+                . ($omitsContainerName
+                    ? '{"<subfield>": "<value>"}'
+                    : '{"<container>": {"<subfield>": "<value>"}}')
+                . '. The list replaces all stored items; an empty list removes them.',
+            ]);
+        }
+
+        $storedIds = is_array($currentNode['el'] ?? null) ? array_keys($currentNode['el']) : [];
+        $elements = [];
+        foreach ($items as $position => $item) {
+            if (!is_array($item)) {
+                throw new ValidationException(["Item $position of $section must be a JSON object."]);
+            }
+
+            if ($omitsContainerName) {
+                $containerName = FlexFormStructureService::ANONYMOUS_CONTAINER;
+                $subValues = $item;
+            } else {
+                if (count($item) !== 1) {
+                    throw new ValidationException([
+                        "Item $position of $section must name exactly one container: "
+                        . implode(', ', array_keys($containers)),
+                    ]);
+                }
+                $containerName = (string)array_key_first($item);
+                $subValues = $item[$containerName];
+                if (!isset($containers[$containerName])) {
+                    throw new ValidationException([
+                        "Unknown container \"$containerName\" in item $position of $section. "
+                        . 'Available containers: ' . implode(', ', array_keys($containers)),
+                    ]);
+                }
+                if (!is_array($subValues)) {
+                    throw new ValidationException([
+                        "Container \"$containerName\" in item $position of $section must be a JSON object of subfields.",
+                    ]);
+                }
+            }
+
+            $subfieldNodes = [];
+            foreach ($subValues as $subfieldName => $subfieldValue) {
+                if (!isset($containers[$containerName][$subfieldName])) {
+                    throw new ValidationException([
+                        "Unknown subfield \"$subfieldName\" in item $position of $section. "
+                        . 'Available subfields: ' . implode(', ', array_keys($containers[$containerName])),
+                    ]);
+                }
+                if (!is_scalar($subfieldValue)) {
+                    throw new ValidationException([
+                        "Subfield \"$subfieldName\" in item $position of $section must be a scalar value.",
+                    ]);
+                }
+                $subfieldNodes[(string)$subfieldName] = ['vDEF' => $subfieldValue];
+            }
+
+            $itemId = (string)($storedIds[$position] ?? StringUtility::getUniqueId());
+            $elements[$itemId] = [$containerName => ['el' => $subfieldNodes]];
+        }
+
+        return ['el' => $elements];
     }
 
     /**
