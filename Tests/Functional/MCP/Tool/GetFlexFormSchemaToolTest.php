@@ -6,7 +6,7 @@ namespace Hn\McpServer\Tests\Functional\MCP\Tool;
 
 use Hn\McpServer\MCP\Tool\Record\GetFlexFormSchemaTool;
 use Mcp\Types\TextContent;
-use TYPO3\CMS\Core\Utility\GeneralUtility;
+use PHPUnit\Framework\Attributes\Test;
 use TYPO3\TestingFramework\Core\Functional\FunctionalTestCase;
 
 class GetFlexFormSchemaToolTest extends FunctionalTestCase
@@ -19,6 +19,7 @@ class GetFlexFormSchemaToolTest extends FunctionalTestCase
     protected array $testExtensionsToLoad = [
         'news',  // Add News extension for success test cases
         'mcp_server',
+        '../Tests/Functional/Fixtures/Extensions/test_flexform',
     ];
 
     protected function setUp(): void
@@ -330,10 +331,9 @@ class GetFlexFormSchemaToolTest extends FunctionalTestCase
         $this->assertStringContainsString('FLEXFORM SCHEMA: news_pi1', $content);
         $this->assertStringContainsString('Table: tt_content', $content);
         $this->assertStringContainsString('Field: pi_flexform', $content);
-        $this->assertStringContainsString('Schema defined in file:', $content);
-        $this->assertStringContainsString('flexform_news_list.xml', $content);
-        
-        // Verify sheets are present
+
+        // Verify sheets are present (resolved via FlexFormTools, so the DS
+        // identifier events have run — no raw file path is exposed anymore)
         $this->assertStringContainsString('SHEETS:', $content);
         $this->assertStringContainsString('Sheet: sDEF', $content);
         $this->assertStringContainsString('Sheet: additional', $content);
@@ -372,8 +372,8 @@ class GetFlexFormSchemaToolTest extends FunctionalTestCase
         $content = $result->content[0]->text;
         
         $this->assertStringContainsString('FLEXFORM SCHEMA: news_categorylist', $content);
-        $this->assertStringContainsString('flexform_category_list.xml', $content);
-        
+        $this->assertStringContainsString('settings.', $content);
+
         // Test detail view FlexForm
         $result = $tool->execute([
             'identifier' => 'news_newsdetail'
@@ -383,7 +383,7 @@ class GetFlexFormSchemaToolTest extends FunctionalTestCase
         $content = $result->content[0]->text;
         
         $this->assertStringContainsString('FLEXFORM SCHEMA: news_newsdetail', $content);
-        $this->assertStringContainsString('flexform_news_detail.xml', $content);
+        $this->assertStringContainsString('settings.', $content);
     }
     
     /**
@@ -393,18 +393,90 @@ class GetFlexFormSchemaToolTest extends FunctionalTestCase
     {
         $tool = new GetFlexFormSchemaTool();
         
-        // recordUid parameter is accepted but not used for schema retrieval
+        // recordUid is used to load the real record for DataStructure resolution;
+        // a non-existing UID must not break resolution via the identifier.
         $result = $tool->execute([
             'identifier' => 'news_pi1',
-            'recordUid' => 123  // This parameter is ignored for schema
+            'recordUid' => 123  // Does not exist in this test setup
         ]);
         
         $this->assertFalse($result->isError);
         $content = $result->content[0]->text;
         
-        // Should still retrieve the schema successfully
+        // Should still retrieve the schema successfully (recordUid 123 does not
+        // exist, so resolution falls back to the synthesized identifier row)
         $this->assertStringContainsString('FLEXFORM SCHEMA: news_pi1', $content);
-        $this->assertStringContainsString('flexform_news_list.xml', $content);
+        $this->assertStringContainsString('settings.', $content);
+    }
+
+    /**
+     * Test that a multi-sheet FlexForm with a non-`settings` subtree lists
+     * all sheets and their fields (test_flexform fixture extension)
+     */
+    public function testGetFlexFormSchemaListsAllSheetsOfMultiSheetFlexForm(): void
+    {
+        $tool = new GetFlexFormSchemaTool();
+
+        $result = $tool->execute([
+            'identifier' => 'test_multisheetflex',
+        ]);
+
+        $this->assertFalse($result->isError, json_encode($result->jsonSerialize()));
+        $content = $result->content[0]->text;
+
+        $this->assertStringContainsString('FLEXFORM SCHEMA: test_multisheetflex', $content);
+        $this->assertStringContainsString('SHEETS:', $content);
+        $this->assertStringContainsString('Sheet: sDEF', $content);
+        $this->assertStringContainsString('Sheet: persistence', $content);
+        $this->assertStringContainsString('settings.contacts', $content);
+        $this->assertStringContainsString('settings.sortOrder', $content);
+        $this->assertStringContainsString('persistence.storagePid', $content);
+    }
+
+    /**
+     * A section is a repeatable item list. The schema must describe the item
+     * shape WriteTable accepts instead of reporting the section as "unknown".
+     */
+    #[Test]
+    public function sectionsDescribeTheirItemShape(): void
+    {
+        $result = (new GetFlexFormSchemaTool())->execute([
+            'identifier' => 'test_sectionflex',
+        ]);
+
+        $this->assertFalse($result->isError, json_encode($result->jsonSerialize()));
+        $content = $result->content[0]->text;
+
+        $this->assertStringContainsString(
+            "  - settings.teasers (Teasers): section\n"
+            . "    JSON Path: pi_flexform.settings.teasers\n"
+            . '    Value: JSON list of items, each {"<container>": {"<subfield>": "<value>"}} with exactly one container; the list replaces all stored items' . "\n"
+            . "    Container: link (Link teaser)\n"
+            . "      - url (URL): input\n"
+            . "    Container: text (Text teaser)\n"
+            . "      - headline (Headline): input\n"
+            . "      - bodytext (Text): text\n",
+            $content
+        );
+        $this->assertStringContainsString(
+            "  - settings.finishers.EmailToReceiver.recipients (Recipients): section\n"
+            . "    JSON Path: pi_flexform.settings.finishers.EmailToReceiver.recipients\n"
+            . '    Value: JSON list of items, each {"<subfield>": "<value>"}; the list replaces all stored items' . "\n"
+            . "    Item subfields:\n"
+            . "      - email (Email): input\n"
+            . "      - name (Name): input\n",
+            $content
+        );
+
+        $jsonExample = json_decode(substr($content, strpos($content, '{', strpos($content, 'JSON STRUCTURE:')), strrpos($content, '}') - strpos($content, '{', strpos($content, 'JSON STRUCTURE:')) + 1), true);
+        $this->assertSame(
+            ['pi_flexform' => ['settings' => [
+                'subject' => '<subject value>',
+                'teasers' => [['link' => ['url' => '<url value>']]],
+                'finishers' => ['EmailToReceiver' => ['recipients' => [['email' => '<email value>', 'name' => '<name value>']]]],
+            ]]],
+            $jsonExample
+        );
     }
 
 }

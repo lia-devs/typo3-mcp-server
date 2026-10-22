@@ -1,0 +1,41 @@
+<T3DataStructure>
+    <sheets>
+        <sDEF>
+            <ROOT>
+                <sheetTitle>Settings</sheetTitle>
+                <type>array</type>
+                <el>
+                    <settings.contacts>
+                        <label>Contacts</label>
+                        <config>
+                            <type>input</type>
+                            <size>30</size>
+                        </config>
+                    </settings.contacts>
+                    <settings.sortOrder>
+                        <label>Sort order</label>
+                        <config>
+                            <type>input</type>
+                            <size>10</size>
+                        </config>
+                    </settings.sortOrder>
+                </el>
+            </ROOT>
+        </sDEF>
+        <persistence>
+            <ROOT>
+                <sheetTitle>Persistence</sheetTitle>
+                <type>array</type>
+                <el>
+                    <persistence.storagePid>
+                        <label>Storage page</label>
+                        <config>
+                            <type>input</type>
+                            <size>30</size>
+                        </config>
+                    </persistence.storagePid>
+                </el>
+            </ROOT>
+        </persistence>
+    </sheets>
+</T3DataStructure>
