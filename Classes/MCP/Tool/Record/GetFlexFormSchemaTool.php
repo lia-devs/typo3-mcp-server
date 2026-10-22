@@ -150,15 +150,31 @@ class GetFlexFormSchemaTool extends AbstractRecordTool
         // Check if field uses TCEforms structure (older format) or direct configuration (newer format)
         $fieldConfig = isset($field['TCEforms']) ? $field['TCEforms'] : $field;
 
-        // Get field label
-        if (isset($fieldConfig['label'])) {
-            $fieldData['label'] = TableAccessService::translateLabel($fieldConfig['label']);
+        // Get field label — sections and their containers carry a `title`
+        $label = $fieldConfig['label'] ?? $fieldConfig['title'] ?? null;
+        if ($label !== null) {
+            $fieldData['label'] = TableAccessService::translateLabel($label);
         }
 
         // Get field type and config
         if (isset($fieldConfig['config']['type'])) {
             $fieldData['type'] = $fieldConfig['config']['type'];
             $fieldData['config'] = $fieldConfig['config'];
+        }
+
+        // A section is a repeatable item list without a `config`: its
+        // containers declare the subfields of an item
+        $structureService = GeneralUtility::makeInstance(FlexFormStructureService::class);
+        if ($structureService->isSection($fieldConfig)) {
+            $fieldData['type'] = 'section';
+            $fieldData['containers'] = [];
+            foreach (($fieldConfig['el'] ?? []) as $containerName => $container) {
+                $fieldData['containers'][(string)$containerName] = [
+                    'label' => TableAccessService::translateLabel($container['title'] ?? (string)$containerName),
+                    'subfields' => $this->processFields($container['el'] ?? []),
+                ];
+            }
+            $fieldData['omitsContainerName'] = $structureService->itemsOmitTheContainerName($fieldData['containers']);
         }
 
         // Get field description
@@ -231,22 +247,19 @@ class GetFlexFormSchemaTool extends AbstractRecordTool
             $data['hasSheets'] = true;
             $data['sheets'] = $this->processSheets($xmlArray['sheets']);
 
-            // Collect all field names for JSON example
-            foreach ($data['sheets'] as $sheet) {
-                foreach ($sheet['fields'] as $field) {
-                    $data['fields'][] = $field['name'];
-                }
-            }
         } elseif (isset($xmlArray['ROOT']['el'])) {
-            // Single sheet FlexForm
-            $processedFields = $this->processFields($xmlArray['ROOT']['el']);
-            $data['fields'] = array_column($processedFields, 'name');
-
-            // Store as single unnamed sheet for consistency
+            // Single sheet FlexForm, stored as single unnamed sheet for consistency
             $data['sheets'][] = [
                 'name' => null,
-                'fields' => $processedFields
+                'fields' => $this->processFields($xmlArray['ROOT']['el'])
             ];
+        }
+
+        // Collect all fields for the JSON example
+        foreach ($data['sheets'] as $sheet) {
+            foreach ($sheet['fields'] as $field) {
+                $data['fields'][$field['name']] = $field;
+            }
         }
 
         return $data;
@@ -337,38 +350,108 @@ class GetFlexFormSchemaTool extends AbstractRecordTool
         $result .= "\n";
         $result .= $indent . "  JSON Path: {$field['jsonPath']}\n";
 
+        if ($field['type'] === 'section') {
+            $result .= $this->formatSectionItems($field, $indent . '  ');
+        }
+
         return $result;
     }
 
     /**
-     * Build example JSON structure from field names
+     * Describe the item shape of a section: WriteTable takes the section as a
+     * JSON list that replaces all stored items, in the same shape ReadTable
+     * returns it.
+     *
+     * @param array $field Processed section field data
      */
-    protected function buildJsonExample(array $fieldNames): array
+    protected function formatSectionItems(array $field, string $indent): string
     {
-        $example = ['pi_flexform' => []];
+        if ($field['omitsContainerName']) {
+            $result = $indent . 'Value: JSON list of items, each {"<subfield>": "<value>"}; '
+                . "the list replaces all stored items\n";
+            $result .= $indent . "Item subfields:\n";
+            foreach ($field['containers'][FlexFormStructureService::ANONYMOUS_CONTAINER]['subfields'] as $subfield) {
+                $result .= $this->formatSubfield($subfield, $indent . '  ');
+            }
+            return $result;
+        }
 
-        foreach ($fieldNames as $fieldName) {
-            // Skip non-field entries
-            if (strpos($fieldName, '.') === false) {
-                $example['pi_flexform'][$fieldName] = '<' . $fieldName . ' value>';
-            } else {
-                // Handle nested structure
-                $parts = explode('.', $fieldName);
-                $current = &$example['pi_flexform'];
-
-                // Navigate/create the nested structure
-                for ($i = 0; $i < count($parts) - 1; $i++) {
-                    if (!isset($current[$parts[$i]])) {
-                        $current[$parts[$i]] = [];
-                    }
-                    $current = &$current[$parts[$i]];
-                }
-
-                // Set the final value
-                $current[$parts[count($parts) - 1]] = '<' . $parts[count($parts) - 1] . ' value>';
+        $result = $indent . 'Value: JSON list of items, each {"<container>": {"<subfield>": "<value>"}} '
+            . "with exactly one container; the list replaces all stored items\n";
+        foreach ($field['containers'] as $containerName => $container) {
+            $result .= $indent . "Container: $containerName";
+            if ($container['label'] !== $containerName) {
+                $result .= " ({$container['label']})";
+            }
+            $result .= "\n";
+            foreach ($container['subfields'] as $subfield) {
+                $result .= $this->formatSubfield($subfield, $indent . '  ');
             }
         }
 
+        return $result;
+    }
+
+    /**
+     * Format a subfield of a section item — it has no JSON path of its own
+     */
+    protected function formatSubfield(array $subfield, string $indent): string
+    {
+        $result = $indent . "- {$subfield['name']}";
+        if ($subfield['label'] !== $subfield['name']) {
+            $result .= " ({$subfield['label']})";
+        }
+        $result .= ": {$subfield['type']}";
+        if (!empty($subfield['config'])) {
+            TcaFormattingUtility::addFieldDetailsInline($result, $subfield['config']);
+        }
+
+        return $result . "\n";
+    }
+
+    /**
+     * Build example JSON structure from the processed fields
+     *
+     * @param array<string, array> $fields processed field data keyed by field name
+     */
+    protected function buildJsonExample(array $fields): array
+    {
+        $example = ['pi_flexform' => []];
+
+        foreach ($fields as $fieldName => $field) {
+            $parts = explode('.', (string)$fieldName);
+            $current = &$example['pi_flexform'];
+
+            // Navigate/create the nested structure
+            for ($i = 0; $i < count($parts) - 1; $i++) {
+                if (!isset($current[$parts[$i]])) {
+                    $current[$parts[$i]] = [];
+                }
+                $current = &$current[$parts[$i]];
+            }
+
+            // Set the final value
+            $lastPart = $parts[count($parts) - 1];
+            $current[$lastPart] = $field['type'] === 'section'
+                ? [$this->buildSectionItemExample($field)]
+                : '<' . $lastPart . ' value>';
+            unset($current);
+        }
+
         return $example;
+    }
+
+    /**
+     * One example item of a section, built from its first container
+     */
+    protected function buildSectionItemExample(array $field): array
+    {
+        $containerName = (string)array_key_first($field['containers']);
+        $item = [];
+        foreach ($field['containers'][$containerName]['subfields'] as $subfield) {
+            $item[$subfield['name']] = '<' . $subfield['name'] . ' value>';
+        }
+
+        return $field['omitsContainerName'] ? $item : [$containerName => $item];
     }
 }

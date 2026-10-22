@@ -6,6 +6,7 @@ namespace Hn\McpServer\Tests\Functional\MCP\Tool;
 
 use Hn\McpServer\MCP\Tool\Record\GetFlexFormSchemaTool;
 use Mcp\Types\TextContent;
+use PHPUnit\Framework\Attributes\Test;
 use TYPO3\TestingFramework\Core\Functional\FunctionalTestCase;
 
 class GetFlexFormSchemaToolTest extends FunctionalTestCase
@@ -430,6 +431,52 @@ class GetFlexFormSchemaToolTest extends FunctionalTestCase
         $this->assertStringContainsString('settings.contacts', $content);
         $this->assertStringContainsString('settings.sortOrder', $content);
         $this->assertStringContainsString('persistence.storagePid', $content);
+    }
+
+    /**
+     * A section is a repeatable item list. The schema must describe the item
+     * shape WriteTable accepts instead of reporting the section as "unknown".
+     */
+    #[Test]
+    public function sectionsDescribeTheirItemShape(): void
+    {
+        $result = (new GetFlexFormSchemaTool())->execute([
+            'identifier' => 'test_sectionflex',
+        ]);
+
+        $this->assertFalse($result->isError, json_encode($result->jsonSerialize()));
+        $content = $result->content[0]->text;
+
+        $this->assertStringContainsString(
+            "  - settings.teasers (Teasers): section\n"
+            . "    JSON Path: pi_flexform.settings.teasers\n"
+            . '    Value: JSON list of items, each {"<container>": {"<subfield>": "<value>"}} with exactly one container; the list replaces all stored items' . "\n"
+            . "    Container: link (Link teaser)\n"
+            . "      - url (URL): input\n"
+            . "    Container: text (Text teaser)\n"
+            . "      - headline (Headline): input\n"
+            . "      - bodytext (Text): text\n",
+            $content
+        );
+        $this->assertStringContainsString(
+            "  - settings.finishers.EmailToReceiver.recipients (Recipients): section\n"
+            . "    JSON Path: pi_flexform.settings.finishers.EmailToReceiver.recipients\n"
+            . '    Value: JSON list of items, each {"<subfield>": "<value>"}; the list replaces all stored items' . "\n"
+            . "    Item subfields:\n"
+            . "      - email (Email): input\n"
+            . "      - name (Name): input\n",
+            $content
+        );
+
+        $jsonExample = json_decode(substr($content, strpos($content, '{', strpos($content, 'JSON STRUCTURE:')), strrpos($content, '}') - strpos($content, '{', strpos($content, 'JSON STRUCTURE:')) + 1), true);
+        $this->assertSame(
+            ['pi_flexform' => ['settings' => [
+                'subject' => '<subject value>',
+                'teasers' => [['link' => ['url' => '<url value>']]],
+                'finishers' => ['EmailToReceiver' => ['recipients' => [['email' => '<email value>', 'name' => '<name value>']]]],
+            ]]],
+            $jsonExample
+        );
     }
 
 }

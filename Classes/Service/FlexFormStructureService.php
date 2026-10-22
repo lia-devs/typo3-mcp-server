@@ -38,6 +38,11 @@ use TYPO3\CMS\Core\Utility\GeneralUtility;
  */
 class FlexFormStructureService implements SingletonInterface
 {
+    /**
+     * Container name FlexFormService skips when converting a section item
+     */
+    public const ANONYMOUS_CONTAINER = '_arrayContainer';
+
     protected TcaSchemaFactory $tcaSchemaFactory;
 
     public function __construct()
@@ -118,6 +123,63 @@ class FlexFormStructureService implements SingletonInterface
         }
 
         return $map;
+    }
+
+    /**
+     * Map every section of a parsed DataStructure to its containers, keyed by
+     * the dotted field name.
+     *
+     * A section is a repeatable list. Each stored item holds exactly one of
+     * the section's containers, and the container declares the item's
+     * subfields.
+     *
+     * @return array<string, array<string, array<string, array<string, mixed>>>>
+     *         dotted field name => container name => subfield name => subfield config
+     */
+    public function getSectionContainers(array $structure): array
+    {
+        $sections = [];
+
+        foreach (($structure['sheets'] ?? []) as $sheet) {
+            foreach (($sheet['ROOT']['el'] ?? []) as $fieldName => $fieldConfig) {
+                if (!$this->isSection($fieldConfig)) {
+                    continue;
+                }
+                foreach (($fieldConfig['el'] ?? []) as $containerName => $container) {
+                    $sections[(string)$fieldName][(string)$containerName] = $container['el'] ?? [];
+                }
+            }
+        }
+
+        return $sections;
+    }
+
+    /**
+     * Whether a DataStructure field is a section — the same test FormEngine
+     * and DataHandler apply. ext:form declares `section: true`, FlexForm XML
+     * files `<section>1</section>`.
+     *
+     * @param array<string, mixed> $fieldConfig
+     */
+    public function isSection(array $fieldConfig): bool
+    {
+        return (int)($fieldConfig['section'] ?? 0) === 1;
+    }
+
+    /**
+     * Whether the items of a section carry their subfields directly instead
+     * of under a container name.
+     *
+     * That is the case for a section whose only container is
+     * `_arrayContainer` (ext:form's finisher overrides): FlexFormService
+     * leaves that container level out when reading, so the client sees and
+     * writes {"email": ..., "name": ...} per item.
+     *
+     * @param array<string, mixed> $containers container name => subfield configs
+     */
+    public function itemsOmitTheContainerName(array $containers): bool
+    {
+        return array_keys($containers) === [self::ANONYMOUS_CONTAINER];
     }
 
     /**
