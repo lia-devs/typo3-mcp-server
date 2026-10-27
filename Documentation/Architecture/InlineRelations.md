@@ -92,17 +92,28 @@ $writeTool->execute([
 ]);
 ```
 
-### Method 2: Parent Record Update with UIDs (Implemented)
-For independent relations, pass array of UIDs when updating parent:
+### Method 2: Parent Record Write with UIDs or Record Data (Implemented)
+For independent relations, each item of the array is one of:
+
+- a UID: link that record,
+- `{"uid": N, ...}`: link that record and patch the fields given (through `updateRecord()`),
+- record data without a uid: create a new record and link it (through `createRecord()`, so it
+  is validated like any other write and may carry inline fields of its own, e.g. `assets`).
+
+On update the list replaces the linked records: records left out are unlinked, not deleted.
 
 ```php
-// Update news with content elements
+// Keep 456, patch 789, create a new content element
 $writeTool->execute([
     'table' => 'tx_news_domain_model_news',
     'action' => 'update',
     'uid' => 123,
     'data' => [
-        'content_elements' => [456, 789, 1011]  // Array of UIDs
+        'content_elements' => [
+            456,
+            ['uid' => 789, 'header' => 'Updated header'],
+            ['CType' => 'text', 'header' => 'New element'],
+        ]
     ]
 ]);
 ```
@@ -146,6 +157,11 @@ $writeTool->execute([
 - `sys_file` itself is read-only - files are managed through the filesystem, not direct DB edits
 - New files are created with the `UploadFile` tool (from a URL, a YouTube/Vimeo link, text content,
   or a pre-signed upload); the resulting `sys_file` uid is then referenced via `uid_local`
+- A file field of the written record also takes plain `sys_file` uids (`'media' => [3, 4]`),
+  short for `[['uid_local' => 3], ['uid_local' => 4]]`. In any other embedded relation of the
+  written record an integer is the uid of an existing child, short for `['uid' => N]`.
+  Relations nested inside an embedded child take objects only
+- A new file reference without `uid_local` is rejected instead of being written without a file
 
 ### 3. Automatic Workspace Handling
 - Both ReadTableTool and WriteTableTool automatically initialize workspace context via `WorkspaceContextService`

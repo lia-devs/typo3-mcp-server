@@ -93,7 +93,10 @@ class WriteTableTool extends AbstractRecordTool
                             'on "update" setting "pid" moves the record to that page (combine with "position" to control where on the new page it lands; e.g. data: {"pid": 1} moves the record to page 1). ' .
                             ($hasMultipleLanguages ? 'Language fields (sys_language_uid) accept ISO codes like "de", "fr" instead of numeric IDs. ' .
                                 '"update" never changes the language of a record; to translate a record use "translate", which creates a linked translation. ' : '') .
-                            'Inline relations can be specified as arrays - UIDs for independent tables, record data for embedded tables. ' .
+                            'Inline relations are arrays. For independent tables (e.g. content_elements → tt_content) each item is a UID to link, ' .
+                            '{"uid": <existing>, ...} to link and patch it, or record data to create a new linked record — nested inline fields included. ' .
+                            'File fields (image, media, assets) take sys_file UIDs [3, 4] or objects [{"uid_local": 3, "title": "...", "alternative": "..."}]. ' .
+                            'For other embedded tables each item is record data, or the UID of an existing child. ' .
                             'For embedded tables (e.g. file references), the array fully replaces the existing list: ' .
                             'children present in the previous record but missing from the new array are deleted. ' .
                             'To keep an existing child include it as {"uid": <existing>, ...}; only the fields you set are patched. ' .
@@ -1477,7 +1480,8 @@ class WriteTableTool extends AbstractRecordTool
             ) {
                 continue;
             }
-            foreach ($relationData['value'] as $childUid) {
+            foreach ($relationData['value'] as $item) {
+                $childUid = is_array($item) ? ($item['uid'] ?? null) : $item;
                 if (is_numeric($childUid) && (int)$childUid > 0) {
                     array_push($parents, ...$this->inlineParentService->findParents($foreignTable, (int)$childUid));
                 }
@@ -1523,6 +1527,7 @@ class WriteTableTool extends AbstractRecordTool
 
             if ($isHiddenTable) {
                 // Process embedded inline relations (e.g., tx_news_domain_model_link)
+                $value = $this->normalizeEmbeddedItems($config, $value);
                 $order = $this->processEmbeddedInlineRelations($dataMap, $foreignTable, $foreignField, $parentUid, $pid, $value, $config, $liveUid, $parentTable);
                 $embeddedRelations[$fieldName] = [
                     'foreignTable' => $foreignTable,
@@ -1531,7 +1536,7 @@ class WriteTableTool extends AbstractRecordTool
                 ];
             } else {
                 // Process independent inline relations (e.g., tt_content)
-                $this->processIndependentInlineRelations($foreignTable, $foreignField, $parentUid, $value, $liveUid);
+                $this->processIndependentInlineRelations($foreignTable, $foreignField, $parentUid, $pid, $value, $liveUid);
             }
         }
 
@@ -1938,13 +1943,36 @@ class WriteTableTool extends AbstractRecordTool
     }
     
     /**
-     * Process independent inline relations (UIDs only)
+     * An integer in an embedded relation of the written record names something that exists
+     * already: the file in a file field (sys_file uid), the child record anywhere else.
+     * Turned into the object form here, so the embedded handling only deals with record data.
+     * Relations nested deeper take objects only (see resolveNestedEmbeddedRelations()).
+     */
+    protected function normalizeEmbeddedItems(array $config, array $items): array
+    {
+        $isFileField = ($config['type'] ?? '') === 'file';
+        foreach ($items as $index => $item) {
+            if (is_numeric($item)) {
+                $items[$index] = $isFileField ? ['uid_local' => (int)$item] : ['uid' => (int)$item];
+            }
+        }
+        return $items;
+    }
+
+    /**
+     * Process independent inline relations (e.g. content_elements → tt_content).
+     *
+     * Each item is a UID to link, {"uid": N, ...} to link and patch that record, or record
+     * data for a new record. New and patched records go through createRecord() and
+     * updateRecord(), so they are validated like any other write and may carry inline
+     * fields of their own.
      */
     protected function processIndependentInlineRelations(
         string $foreignTable,
         string $foreignField,
         $parentUid,
-        array $uids,
+        int $pid,
+        array $items,
         ?int $liveUid = null
     ): void {
         // For updates, we need to handle existing relations
@@ -1952,28 +1980,68 @@ class WriteTableTool extends AbstractRecordTool
             // First, clear existing relations
             $this->clearExistingInlineRelations($foreignTable, $foreignField, $liveUid);
         }
-        
+
+        $uids = [];
+        foreach ($items as $index => $item) {
+            if (!is_array($item)) {
+                if (is_numeric($item) && $item > 0) {
+                    $uids[] = (int)$item;
+                }
+                continue;
+            }
+
+            // The relation is set below for every item alike
+            unset($item[$foreignField]);
+
+            // A nested write runs processInlineRelations() again, which starts a fresh
+            // collection; the parent's own pending foreign fields must survive it.
+            $pendingNestedForeignFields = $this->pendingNestedForeignFields;
+            if (isset($item['uid'])) {
+                $childUid = (int)$item['uid'];
+                unset($item['uid']);
+                if ($item !== []) {
+                    $this->requireChildWritten($this->updateRecord($foreignTable, $childUid, $item), $foreignTable, $index);
+                }
+                $uids[] = $childUid;
+            } else {
+                $uids[] = $this->requireChildWritten($this->createRecord($foreignTable, $pid, $item, 'bottom'), $foreignTable, $index);
+            }
+            $this->pendingNestedForeignFields = $pendingNestedForeignFields;
+        }
+
         // Update foreign field on specified records
         if (!empty($uids)) {
             $dataHandler = GeneralUtility::makeInstance(DataHandler::class);
             $dataHandler->BE_USER = $GLOBALS['BE_USER'];
-            
+
             $updateMap = [];
             foreach ($uids as $uid) {
-                if (is_numeric($uid) && $uid > 0) {
+                if ($uid > 0) {
                     $updateMap[$foreignTable][$uid] = [
                         $foreignField => $liveUid ?? $parentUid
                     ];
                 }
             }
-            
+
             if (!empty($updateMap)) {
                 $dataHandler->start($updateMap, []);
                 $dataHandler->process_datamap();
             }
         }
     }
-    
+
+    /**
+     * The live uid a nested create or update reports; its error as a validation error.
+     */
+    protected function requireChildWritten(CallToolResult $result, string $table, int|string $index): int
+    {
+        $text = $result->content[0]->text ?? '';
+        if ($result->isError) {
+            throw new ValidationException(["Item $index of the inline relation to $table: $text"]);
+        }
+        return (int)(json_decode($text, true)['uid'] ?? 0);
+    }
+
     /**
      * Clear existing inline relations
      */
@@ -2114,6 +2182,10 @@ class WriteTableTool extends AbstractRecordTool
     
     /**
      * Validate inline relation data
+     *
+     * Every item is record data or a positive integer UID (see normalizeEmbeddedItems() and
+     * processIndependentInlineRelations() for what a UID means where). A new file reference
+     * has to name its file.
      */
     protected function validateInlineRelationData(array $fieldConfig, $value): ?string
     {
@@ -2121,35 +2193,29 @@ class WriteTableTool extends AbstractRecordTool
         if (!is_array($value)) {
             return 'Inline relation field must be an array of UIDs or record data';
         }
-        
+
         // Get foreign table
         $foreignTable = $fieldConfig['config']['foreign_table'] ?? '';
         if (empty($foreignTable)) {
             return 'Invalid inline relation configuration: missing foreign_table';
         }
-        
-        // Check if foreign table is treated as embedded inline child
-        $isHiddenTable = $this->tableAccessService->isEmbeddedChildTable($foreignTable);
 
-        // Validate each item
+        $isFileField = ($fieldConfig['config']['type'] ?? '') === 'file';
         foreach ($value as $index => $item) {
-            if ($isHiddenTable) {
-                // For hidden tables, expect record data arrays
-                if (!is_array($item)) {
-                    return 'Embedded inline relations must contain record data arrays';
-                }
-                // Basic validation - must have at least one field
+            if (is_array($item)) {
                 if (empty($item)) {
-                    return 'Embedded inline relation record at index ' . $index . ' is empty';
+                    return 'Inline relation record at index ' . $index . ' is empty';
                 }
-            } else {
-                // For independent tables, expect UIDs
-                if (!is_numeric($item) || $item <= 0) {
-                    return 'Independent inline relations must contain only positive integer UIDs';
+                if ($isFileField && !isset($item['uid']) && !isset($item['uid_local'])) {
+                    return 'File reference at index ' . $index . ' must name its file: pass the sys_file uid, or an object with uid_local';
                 }
+                continue;
+            }
+            if (!is_numeric($item) || $item <= 0) {
+                return 'Inline relation item at index ' . $index . ' must be a record data array or a positive integer UID';
             }
         }
-        
+
         return null;
     }
     
