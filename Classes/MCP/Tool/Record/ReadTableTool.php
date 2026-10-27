@@ -129,7 +129,8 @@ class ReadTableTool extends AbstractRecordTool
         }
 
         return [
-            'description' => 'Read records from TYPO3 tables with filtering, pagination, and relation embedding. Also provides access to the fileadmin: read sys_file to browse available files and images. By default, returns records from ALL languages mixed together (matching TYPO3\'s list module behavior). Use the language parameter to filter to a specific language. For page content, use pid filter instead of individual record lookups.',
+            'description' => 'Read records from TYPO3 tables with filtering, pagination, and relation embedding. Also provides access to the fileadmin: read sys_file to browse available files and images. By default, returns records from ALL languages mixed together (matching TYPO3\'s list module behavior). Use the language parameter to filter to a specific language. For page content, use pid filter instead of individual record lookups. ' .
+                'FLEXFORM FIELDS (e.g. pi_flexform) are returned as nested JSON objects across all sheets, e.g. {"settings": {"orderBy": "datetime"}, "persistence": {"storagePid": "12"}} — the same shape WriteTable accepts, so a value read here can be written straight back. Send that JSON, never the stored XML.',
             'inputSchema' => [
                 'type' => 'object',
                 'properties' => $properties,
@@ -644,44 +645,28 @@ class ReadTableTool extends AbstractRecordTool
 
         // Convert FlexForm XML to JSON
         if ($this->tableAccessService->isFlexFormField($table, $field) && is_string($value) && !empty($value) && strpos($value, '<?xml') === 0) {
-            try {
-                // Use TYPO3's FlexFormService to convert XML to array. The
-                // class is aliased to FlexFormTools in TYPO3 14 (#107945) but
-                // the method signature is identical.
-                $flexFormService = GeneralUtility::makeInstance(FlexFormService::class);
-                $flexFormArray = $flexFormService->convertFlexFormContentToArray($value);
-
-                // Simplify the structure for easier use in LLMs
-                $result = [];
-                $settings = [];
-
-                // Process each field and organize settings
-                foreach ($flexFormArray as $key => $val) {
-                    // Check if this is a settings field (key starts with "settings")
-                    if (strpos($key, 'settings') === 0 && strlen($key) > 8) {
-                        // Extract the setting name (remove "settings" prefix)
-                        $settingName = substr($key, 8);
-                        // Convert first character to lowercase if it's uppercase
-                        if (ctype_upper($settingName[0])) {
-                            $settingName = lcfirst($settingName);
-                        }
-                        $settings[$settingName] = $val;
-                    } else {
-                        $result[$key] = $val;
-                    }
-                }
-
-                // Add settings to result if any were found
-                if (!empty($settings)) {
-                    $result['settings'] = $settings;
-                }
-
-                return $result;
-            } catch (\Exception $e) {
-                // Log the error but continue with empty result
-                $this->logException($e, 'parsing flexform XML');
-                return [];
+            // Validate the XML explicitly: xml2array() returns an error STRING
+            // for unparseable XML, and FlexFormService would silently turn
+            // that into an empty array (its `['data'] ?? []` swallows the
+            // error string). A silently empty result would hide data
+            // corruption from the client — report it instead.
+            $parsed = GeneralUtility::xml2array($value);
+            if (!is_array($parsed)) {
+                throw new McpException(
+                    "Failed to parse the stored FlexForm XML of $table.$field: $parsed",
+                    "The FlexForm value of $table.$field cannot be parsed; the stored XML is invalid.",
+                    422
+                );
             }
+
+            // Use TYPO3's FlexFormService to convert XML to array. The
+            // class is aliased to FlexFormTools in TYPO3 14 (#107945) but
+            // the method signature is identical. It flattens all sheets
+            // and expands every dotted field name into a nested structure
+            // ("persistence.storagePid" => {"persistence": {"storagePid":
+            // ...}}) — symmetric to what WriteTable accepts as input.
+            $flexFormService = GeneralUtility::makeInstance(FlexFormService::class);
+            return $this->listFlexFormSectionItems($parsed, $flexFormService->convertFlexFormContentToArray($value));
         }
 
         // Convert JSON strings to arrays
@@ -703,6 +688,44 @@ class ReadTableTool extends AbstractRecordTool
         }
 
         return $value;
+    }
+
+    /**
+     * Turn the items of every FlexForm section into a JSON list.
+     *
+     * FlexFormService keys section items by their stored ids — random strings
+     * that mean nothing to a client. WriteTable takes a section as a list and
+     * assigns the ids itself, so the items are listed here in stored order:
+     * what ReadTable returns, WriteTable accepts. A stored section is a lDEF
+     * node holding `el` instead of `vDEF`.
+     *
+     * @param array<string, mixed> $parsedXml the stored value as parsed by xml2array()
+     * @param array<string, mixed> $converted the same value converted by FlexFormService
+     * @return array<string, mixed>
+     */
+    protected function listFlexFormSectionItems(array $parsedXml, array $converted): array
+    {
+        foreach (($parsedXml['data'] ?? []) as $languages) {
+            if (!is_array($languages['lDEF'] ?? false)) {
+                continue;
+            }
+            foreach ($languages['lDEF'] as $fieldName => $node) {
+                if (!is_array($node) || !array_key_exists('el', $node)) {
+                    continue;
+                }
+                // FlexFormService nests dotted field names, so the section
+                // sits at the path its name spells out
+                $items = &$converted;
+                foreach (explode('.', (string)$fieldName) as $pathSegment) {
+                    $items = &$items[$pathSegment];
+                }
+                // A section without items is stored as an empty `el`
+                $items = is_array($items) ? array_values($items) : [];
+                unset($items);
+            }
+        }
+
+        return $converted;
     }
 
     /**

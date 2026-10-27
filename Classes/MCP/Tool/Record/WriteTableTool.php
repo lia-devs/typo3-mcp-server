@@ -10,6 +10,7 @@ use Hn\McpServer\Event\BeforeRecordWriteEvent;
 use Hn\McpServer\Exception\DatabaseException;
 use Hn\McpServer\Exception\ValidationException;
 use Hn\McpServer\Service\InlineParentService;
+use Hn\McpServer\Service\FlexFormStructureService;
 use Hn\McpServer\Service\LanguageService;
 use Mcp\Types\CallToolResult;
 use Psr\EventDispatcher\EventDispatcherInterface;
@@ -17,6 +18,7 @@ use TYPO3\CMS\Backend\Utility\BackendUtility;
 use TYPO3\CMS\Core\Configuration\FlexForm\FlexFormTools;
 use TYPO3\CMS\Core\DataHandling\DataHandler;
 use TYPO3\CMS\Core\Utility\GeneralUtility;
+use TYPO3\CMS\Core\Utility\StringUtility;
 use TYPO3\CMS\Core\Database\ConnectionPool;
 use TYPO3\CMS\Core\Database\Query\Restriction\DeletedRestriction;
 use TYPO3\CMS\Core\Database\Query\Restriction\WorkspaceRestriction;
@@ -36,6 +38,12 @@ class WriteTableTool extends AbstractRecordTool
      * @var array<int, array{table: string, key: int|string, foreignField: string, parentTable: string, parentKey: int|string}>
      */
     protected array $pendingNestedForeignFields = [];
+
+    /**
+     * Whether this call may write a raw FlexForm XML string, which replaces the stored
+     * structure wholesale. Set per call from the replaceFlexFormXml parameter.
+     */
+    protected bool $allowRawFlexFormXml = false;
 
     public function __construct()
     {
@@ -100,7 +108,13 @@ class WriteTableTool extends AbstractRecordTool
                             'Array order drives display order. ' .
                             'For text fields in update actions, instead of providing the full text, you can provide an array of search-and-replace operations: ' .
                             '[{"search": "old text", "replace": "new text"}]. Each operation can optionally include "replaceAll": true. ' .
-                            'Operations are applied sequentially. Each search string must match exactly once unless replaceAll is true.',
+                            'Operations are applied sequentially. Each search string must match exactly once unless replaceAll is true. ' .
+                            'FLEXFORM (e.g. pi_flexform): Pass a nested JSON object, e.g. {"settings": {"orderBy": "datetime"}, "persistence": {"storagePid": "12"}} — the conversion to the stored XML happens for you. ' .
+                            'PARTIAL PATCH: omitted fields keep their stored values, so send only what changes. Each field must be declared by the record type\'s DataStructure and is placed in its own sheet automatically; ' .
+                            'call GetFlexFormSchema first, because unknown fields and fields declared in several sheets are rejected with the list of valid names. ' .
+                            'SECTIONS (repeatable lists, e.g. form finisher recipients) take a JSON list of items that REPLACES all stored items — send the complete list, [] removes all; GetFlexFormSchema shows the item shape. ' .
+                            'Do not pass FlexForm XML: it would replace the whole stored structure, so it is refused unless "replaceFlexFormXml" is set. ' .
+                            'ReadTable returns exactly the JSON shape to send back.',
                         'additionalProperties' => true,
                         'examples' => [
                             ['pid' => 42, 'title' => 'News Title', 'bodytext' => 'News <b>content</b>', 'datetime' => '2024-01-01 10:00:00'],
@@ -113,6 +127,14 @@ class WriteTableTool extends AbstractRecordTool
                     'position' => [
                         'type' => 'string',
                         'description' => 'Sorting position within a page: "top", "bottom", "after:UID", or "before:UID". For create: defaults to "bottom" if omitted. For update: omit to keep the current sort order, or specify to reorder. To move a record to a DIFFERENT page, set "pid" in the data parameter instead (or together with "position" for fine-grained placement on the new page).',
+                    ],
+                    'replaceFlexFormXml' => [
+                        'type' => 'boolean',
+                        'description' => 'Allow a raw FlexForm XML string (starting with "<?xml") as a FlexForm field value, '
+                            . 'replacing the whole stored structure instead of patching it. Off by default and almost never '
+                            . 'what you want: every field the XML omits is erased. Pass a nested JSON object instead — that is '
+                            . 'a partial patch. This exists only to repair a stored value that can no longer be parsed.',
+                        'default' => false,
                     ],
                 ],
                 'required' => ['action', 'table'],
@@ -178,6 +200,12 @@ class WriteTableTool extends AbstractRecordTool
         // pid lives inside `data` (it's a record column). On create it picks
         // the target page; on update it triggers a move to that page.
         $pid = is_array($data) && isset($data['pid']) ? (int)$data['pid'] : null;
+
+        // Raw FlexForm XML replaces the stored structure wholesale, so it is
+        // only accepted when this call says so (see convertDataForStorage).
+        // Assigned on every call: the tool instance is shared across calls,
+        // and a `true` must never survive into the next one.
+        $this->allowRawFlexFormXml = (bool)($params['replaceFlexFormXml'] ?? false);
 
         if (in_array($action, ['create', 'update', 'translate'], true)) {
             $positionProvided = $position !== null;
@@ -2369,8 +2397,23 @@ class WriteTableTool extends AbstractRecordTool
 
             // Handle FlexForm fields
             if ($this->isFlexFormField($table, $fieldName)) {
-                // If the value is already a string (XML), keep it as is
+                // A raw XML string replaces the entire stored structure: it
+                // skips both the fetch-and-merge partial patch and the
+                // DataStructure check below, so every field the string omits is
+                // erased — silently, and reported as success. That is a
+                // legitimate last resort for a stored value that no longer
+                // parses (see extractFlexFormNodes), and nothing a caller should
+                // reach by accident, so it takes an explicit opt-in.
                 if (is_string($value) && strpos($value, '<?xml') === 0) {
+                    if (!$this->allowRawFlexFormXml) {
+                        throw new ValidationException([
+                            "The value of $table.$fieldName is a raw FlexForm XML string. It would replace the "
+                            . 'whole stored structure and erase every field it omits. Pass a nested JSON object '
+                            . 'instead — that is applied as a partial patch, e.g. {"settings": {"orderBy": "datetime"}}. '
+                            . 'To replace the structure on purpose (e.g. to repair an unparseable value), set '
+                            . '"replaceFlexFormXml": true.',
+                        ]);
+                    }
                     continue;
                 }
 
@@ -2378,7 +2421,7 @@ class WriteTableTool extends AbstractRecordTool
                 $flexFormArray = is_array($value) ? $value : (is_string($value) && strpos($value, '{') === 0 ? json_decode($value, true) : null);
 
                 if (is_array($flexFormArray)) {
-                    $data[$fieldName] = $this->buildFlexFormXml($table, $fieldName, $flexFormArray, $data, $uid);
+                    $data[$fieldName] = $this->convertFlexFormValueForStorage($table, $fieldName, $flexFormArray, $uid, $data);
                 }
             }
         }
@@ -2387,284 +2430,327 @@ class WriteTableTool extends AbstractRecordTool
     }
 
     /**
-     * Build the FlexForm XML for one field, with each value placed in the
-     * sheet its real DataStructure declares.
+     * Convert a FlexForm JSON/array value into the XML DataHandler stores.
      *
-     * @param array $data The record's full data (used to resolve the record
-     *                     type when it's part of this write, e.g. CType on create).
+     * The incoming value is a PARTIAL PATCH, not a full replacement: the
+     * record's current FlexForm value is loaded (workspace version — the
+     * caller passes the workspace UID), the incoming dotted-path values are
+     * overlaid, and the merged set is serialized. DataHandler's own
+     * merge-with-current logic only runs for array input; this tool passes
+     * pre-serialized XML strings, which DataHandler stores as-is — without
+     * this merge, updating one FlexForm field would delete all others.
+     *
+     * Every field is placed into the sheet its DataStructure declares it in
+     * (FormEngine renders per-sheet backend tabs, and EXT:form injects
+     * finisher-override fields under dynamically created sheet keys). ALL
+     * nested subtrees are dot-flattened — not only `settings`: a value like
+     * {"persistence": {"storagePid": "1"}} becomes the FlexForm field
+     * "persistence.storagePid". Fields the DataStructure does not declare
+     * are rejected with an explicit error instead of being silently dropped.
+     *
+     * @param array<string, mixed> $value Decoded FlexForm value from the client
+     * @param int|null $recordUid UID of the record on update (live or workspace), null on create
+     * @param array<string, mixed> $pendingData Full pending write payload — its
+     *                             pointer fields (e.g. a CType change in the
+     *                             same request) win over the stored record when
+     *                             resolving the DataStructure
      */
-    protected function buildFlexFormXml(string $table, string $fieldName, array $flexFormArray, array $data, ?int $uid): string
-    {
-        // Flatten every top-level array value with its own key as prefix, not
-        // just "settings" — a DataStructure isn't required to nest all its
-        // fields there (e.g. classic non-Extbase DataStructures commonly
-        // don't), and this server's own GetFlexFormSchemaTool examples
-        // reflect whatever grouping the real DataStructure declares.
-        $flatFields = [];
-        foreach ($flexFormArray as $key => $val) {
-            if (is_array($val)) {
-                $flatFields += $this->flattenFlexFormSettings($val, (string)$key);
+    protected function convertFlexFormValueForStorage(
+        string $table,
+        string $fieldName,
+        array $value,
+        ?int $recordUid,
+        array $pendingData
+    ): string {
+        // Merge against the value the caller sees: the workspace version when
+        // there is one, so a patch keeps the earlier draft changes
+        $currentRecord = $recordUid !== null ? BackendUtility::getRecord($table, $recordUid) : null;
+        if (is_array($currentRecord)) {
+            BackendUtility::workspaceOL($table, $currentRecord);
+        }
+        $currentRecord = is_array($currentRecord) ? $currentRecord : null;
+        $currentXml = is_string($currentRecord[$fieldName] ?? null) ? $currentRecord[$fieldName] : '';
+
+        // Row context for DataStructure resolution: stored record merged with
+        // the pending payload (pending wins — covers CType changes in the same
+        // request). The FlexForm field itself must stay the stored XML string:
+        // DS events (EXT:form) read it to locate the persistenceIdentifier.
+        $row = array_merge($currentRecord ?? [], $pendingData);
+        $row[$fieldName] = $currentXml;
+
+        $structureService = GeneralUtility::makeInstance(FlexFormStructureService::class);
+        $structure = $structureService->resolveDataStructureForRecord($table, $fieldName, $row);
+        if ($structure === null) {
+            throw new ValidationException([
+                "Cannot resolve the FlexForm data structure for $table.$fieldName. "
+                . 'The record type (e.g. CType) does not declare a FlexForm schema, so JSON FlexForm values cannot be mapped. '
+                . 'Use GetFlexFormSchema to inspect available structures.',
+            ]);
+        }
+        $fieldSheetMap = $structureService->getFieldSheetMap($structure);
+        $sectionContainers = $structureService->getSectionContainers($structure);
+
+        // Validate the incoming fields against the DataStructure before merging
+        $incomingValues = [];
+        foreach ($value as $key => $subValue) {
+            if ($subValue === [] && !isset($sectionContainers[(string)$key])) {
+                // An empty group names no field: nothing to write
+                continue;
+            }
+            if (isset($sectionContainers[(string)$key])) {
+                $incomingValues[(string)$key] = $subValue;
+            } elseif (is_array($subValue) && array_is_list($subValue)) {
+                // A list is the value of a single multi-select field, stored comma-separated
+                $incomingValues[(string)$key] = implode(',', array_map('strval', $subValue));
+            } elseif (is_array($subValue)) {
+                $incomingValues += $this->flattenFlexFormSettings($subValue, (string)$key, $sectionContainers);
             } else {
-                $flatFields[$key] = $val;
+                $incomingValues[(string)$key] = $subValue;
+            }
+        }
+        foreach (array_keys($incomingValues) as $flatKey) {
+            if (!isset($fieldSheetMap[$flatKey])) {
+                throw new ValidationException([
+                    "Unknown FlexForm field \"$flatKey\" for $table.$fieldName: the resolved data structure does not declare it. "
+                    . 'Available fields: ' . implode(', ', array_keys($fieldSheetMap)),
+                ]);
+            }
+            if (count($fieldSheetMap[$flatKey]) > 1) {
+                throw new ValidationException([
+                    "Ambiguous FlexForm field \"$flatKey\" for $table.$fieldName: declared in multiple sheets ("
+                    . implode(', ', $fieldSheetMap[$flatKey]) . ')',
+                ]);
             }
         }
 
-        // Resolve which sheet each field actually belongs to per the FlexForm's
-        // real DataStructure. FlexForms with more than one sheet are common
-        // (e.g. a base sheet plus a conditionally shown sheet for
-        // preset/filter-style settings); writing everything into "sDEF"
-        // regardless silently misplaces any field that belongs elsewhere: the
-        // value never reaches wherever the DataStructure-aware readers (the
-        // backend edit form, the plugin itself) actually look for it, even
-        // though ReadTableTool reads it back fine (it doesn't care about
-        // sheets either).
-        $recordType = $this->resolveRecordTypeForFlexForm($table, $data, $uid);
-        $fieldSheets = $this->resolveFlexFormFieldSheets($table, $fieldName, $recordType, $data, $uid);
+        // Build every incoming node before touching the stored value, so a
+        // rejected section item leaves the record unchanged
+        $currentNodes = $this->extractFlexFormNodes($table, $fieldName, $currentXml);
+        $incomingNodes = [];
+        foreach ($incomingValues as $flatKey => $incomingValue) {
+            $incomingNodes[$flatKey] = isset($sectionContainers[$flatKey])
+                ? $this->buildSectionNode(
+                    "$table.$fieldName",
+                    $flatKey,
+                    $incomingValue,
+                    $sectionContainers[$flatKey],
+                    $currentNodes[$flatKey]['node'] ?? []
+                )
+                : ['vDEF' => $incomingValue];
+        }
 
+        // Merge: current nodes first, carried over as stored — sections
+        // included (fields known to the DataStructure are re-placed into their
+        // canonical sheet, which also heals values older tool versions wrote
+        // into sDEF unconditionally; unknown leftovers keep their stored
+        // sheet), then the incoming nodes replace theirs.
         $flexFormData = ['data' => []];
-        foreach ($flatFields as $flatFieldName => $flatFieldValue) {
-            $sheet = $fieldSheets[$flatFieldName] ?? 'sDEF';
-            $flexFormData['data'][$sheet]['lDEF'][$flatFieldName]['vDEF'] = $flatFieldValue;
+        foreach ($currentNodes as $flatKey => $current) {
+            $sheetKey = $fieldSheetMap[$flatKey][0] ?? $current['sheet'];
+            $flexFormData['data'][$sheetKey]['lDEF'][$flatKey] = $current['node'];
         }
-        // TYPO3's FlexForm processing expects a "sDEF" sheet to be present
-        // even when every written value belongs elsewhere (e.g. an update
-        // that only touches a conditionally-shown sheet).
-        if (!isset($flexFormData['data']['sDEF'])) {
-            $flexFormData['data']['sDEF'] = ['lDEF' => []];
+        foreach ($incomingNodes as $flatKey => $node) {
+            $flexFormData['data'][$fieldSheetMap[$flatKey][0]]['lDEF'][$flatKey] = $node;
         }
 
-        // Use TYPO3's own FlexFormTools to convert the array to XML — NOT
-        // GeneralUtility::array2xml() directly. array2xml() always sanitizes
-        // tag names down to `[:alnum:]_-` before writing them, silently
-        // stripping every dot from a key like "settings.preset.locations"
-        // (producing the meaningless tag <settingspresetlocations>, matching
-        // no field in any real DataStructure). FlexFormTools::flexArray2Xml()
-        // avoids that by writing the real field name into an `index`
-        // attribute on a generically-named <field> tag instead of into the
-        // tag name itself — attributes aren't subject to that sanitization —
-        // which is exactly how TYPO3's own FormEngine persists FlexForm data,
-        // and the only shape TYPO3's DataStructure-aware readers (the backend
-        // edit form, the plugin itself) recognize.
+        if ($flexFormData['data'] === []) {
+            // Empty patch on an empty value — keep an empty default sheet so
+            // DataHandler stores a valid FlexForm document.
+            $flexFormData['data'] = ['sDEF' => ['lDEF' => []]];
+        }
+
+        // Serialise via TYPO3's FlexFormTools so dotted field names land in the
+        // `index` attribute (<field index="settings.media.maxWidth">) instead of
+        // being collapsed into a dot-less element name by a bare array2xml.
         $flexFormTools = GeneralUtility::makeInstance(FlexFormTools::class);
         return $flexFormTools->flexArray2Xml($flexFormData);
     }
 
     /**
-     * Flatten nested settings into the dot-separated field names a
-     * DataStructure actually declares (e.g. "settings.preset.locations"),
-     * the same convention TYPO3 extensions use for FlexForm field names. A
-     * list array (sequential integer keys) is treated as the value of a
-     * single multi-select field and imploded into TYPO3's comma-separated
-     * storage format, rather than recursed into further field names.
+     * Flatten a nested FlexForm settings array into dot-notated keys.
+     *
+     * Input:  ['filter' => ['newsTypes' => '250', 'topics' => '12']]
+     * Prefix: 'settings'
+     * Output: ['settings.filter.newsTypes' => '250', 'settings.filter.topics' => '12']
+     *
+     * TYPO3's Extbase plugin settings reader builds a nested array from
+     * dot-separated FlexForm field names, so every leaf must be written as
+     * its own "settings.a.b.c" field — not as a nested XML sub-tree. Sections
+     * are the exception: their item list stays one value under the section's
+     * field name.
+     *
+     * @param array<string, mixed> $sectionContainers see FlexFormStructureService::getSectionContainers()
+     * @return array<string, mixed>
      */
-    protected function flattenFlexFormSettings(array $settings, string $prefix): array
+    protected function flattenFlexFormSettings(array $data, string $prefix, array $sectionContainers): array
     {
-        $result = [];
-        foreach ($settings as $key => $val) {
-            $path = $prefix === '' ? (string)$key : $prefix . '.' . $key;
-            if (is_array($val)) {
-                if (array_is_list($val)) {
-                    $result[$path] = implode(',', array_map('strval', $val));
-                } else {
-                    $result += $this->flattenFlexFormSettings($val, $path);
-                }
+        $flat = [];
+        foreach ($data as $key => $value) {
+            $path = $prefix . '.' . $key;
+            if ($value === [] && !isset($sectionContainers[$path])) {
+                continue;
+            }
+            if (!is_array($value) || isset($sectionContainers[$path])) {
+                // A section's item list is one field value — flattening it would
+                // turn every item subfield into a bogus field name
+                $flat[$path] = $value;
+            } elseif (array_is_list($value)) {
+                // A list is the value of a single multi-select field, stored comma-separated
+                $flat[$path] = implode(',', array_map('strval', $value));
             } else {
-                $result[$path] = $val;
+                $flat += $this->flattenFlexFormSettings($value, $path, $sectionContainers);
             }
         }
-        return $result;
+        return $flat;
     }
 
     /**
-     * Resolve the record type value used to select the correct FlexForm
-     * DataStructure. Prefers the value in $data (present on create, or when a
-     * caller explicitly updates the type field); falls back to loading the
-     * existing record when updating without changing its type.
+     * Extract the stored FlexForm nodes of a record as a flat map of
+     * dotted field name => ['sheet' => sheet key, 'node' => stored node].
      *
-     * On TYPO3 13, plugins are registered as CType="list" with the real
-     * plugin identifier (e.g. "news_pi1") living in a separate subtype field
-     * — conventionally "list_type", declared via the type's
-     * `subtype_value_field` — rather than in CType itself. The FlexForm
-     * DataStructure is keyed by that subtype value, not by "list", so this
-     * resolves it the same way TYPO3 core does whenever a subtype field is
-     * configured for the resolved type. TYPO3 14 has no plugin subtypes
-     * (every plugin is its own CType), so this is a no-op there.
-     */
-    protected function resolveRecordTypeForFlexForm(string $table, array $data, ?int $uid): ?string
-    {
-        $typeField = $this->tableAccessService->getTypeFieldName($table);
-        if ($typeField === null) {
-            return null;
-        }
-
-        $recordType = null;
-        if (isset($data[$typeField]) && is_string($data[$typeField])) {
-            $recordType = $data[$typeField];
-        } elseif ($uid !== null) {
-            $existingRecord = BackendUtility::getRecord($table, $uid, $typeField);
-            if (is_array($existingRecord) && isset($existingRecord[$typeField])) {
-                $recordType = (string)$existingRecord[$typeField];
-            }
-        }
-
-        if ($recordType === null) {
-            return null;
-        }
-
-        $subtypeField = $GLOBALS['TCA'][$table]['types'][$recordType]['subtype_value_field'] ?? null;
-        if (is_string($subtypeField) && $subtypeField !== '') {
-            $subtypeValue = $data[$subtypeField] ?? null;
-            if (!is_string($subtypeValue) && $uid !== null) {
-                $existingRecord = BackendUtility::getRecord($table, $uid, $subtypeField);
-                $subtypeValue = $existingRecord[$subtypeField] ?? null;
-            }
-            if (is_string($subtypeValue) && $subtypeValue !== '') {
-                return $subtypeValue;
-            }
-        }
-
-        return $recordType;
-    }
-
-    /**
-     * Resolve which sheet each field of a FlexForm's DataStructure belongs to.
+     * A node is carried over whole: `['vDEF' => value]` for a plain field,
+     * `['el' => [item id => ...]]` for a section. Keeping only `vDEF` nodes
+     * erased every section on each partial patch.
      *
-     * Returns a [fieldName => sheetName] map built by parsing the actual
-     * DataStructure XML/array for the given table/field/record type — the
-     * same DS a TYPO3 backend edit form or FlexFormService would resolve.
-     * Returns an empty array when no DataStructure could be resolved (e.g.
-     * unknown type, missing file); callers should then default every field
-     * to "sDEF", matching the previous behaviour for genuinely single-sheet
-     * FlexForms.
+     * When the same field name appears in several sheets (older tool versions
+     * wrote every field into sDEF), the last occurrence wins — matching the
+     * read side, where FlexFormService flattens sheets in order.
+     *
+     * @return array<string, array{sheet: string, node: array<string, mixed>}>
      */
-    protected function resolveFlexFormFieldSheets(string $table, string $fieldName, ?string $recordType, array $data, ?int $uid): array
+    protected function extractFlexFormNodes(string $table, string $fieldName, string $currentXml): array
     {
-        $fieldConfig = $GLOBALS['TCA'][$table]['columns'][$fieldName] ?? null;
-        if (!is_array($fieldConfig) || ($fieldConfig['config']['type'] ?? '') !== 'flex') {
+        if ($currentXml === '') {
             return [];
         }
 
-        $xmlArray = null;
+        $parsed = GeneralUtility::xml2array($currentXml);
+        if (!is_array($parsed)) {
+            // xml2array returns an error string for unparseable XML. Merging
+            // against garbage would silently discard the stored value, so be
+            // explicit; raw XML passthrough can be used to overwrite it.
+            throw new ValidationException([
+                "The stored FlexForm value of $table.$fieldName cannot be parsed ($parsed). "
+                . 'To replace it, pass a full FlexForm XML string (starting with <?xml) together with '
+                . '"replaceFlexFormXml": true.',
+            ]);
+        }
 
-        // TYPO3 14: DataStructure attached per record type via columnsOverrides,
-        // rather than through a central ds map keyed by a pointer field.
-        $dsValue = $recordType !== null
-            ? ($GLOBALS['TCA'][$table]['types'][$recordType]['columnsOverrides'][$fieldName]['config']['ds'] ?? null)
-            : null;
-
-        if ($dsValue !== null) {
-            $xmlArray = $this->loadFlexFormDataStructure($dsValue);
-        } else {
-            $dsMap = $fieldConfig['config']['ds'] ?? null;
-            if (is_string($dsMap)) {
-                // Single DS for the whole field, no pointer field involved.
-                $xmlArray = $this->loadFlexFormDataStructure($dsMap);
-            } elseif (is_array($dsMap)) {
-                // TYPO3 13 style: central `ds` map keyed by pointer field
-                // value(s), e.g. "list_type,CType". Resolved through TYPO3's
-                // own FlexFormTools — the exact algorithm DataHandler itself
-                // uses — rather than reimplementing it: that algorithm needs
-                // BOTH pointer field values at once, in a specific candidate
-                // order, to build the right key (a single collapsed
-                // "$recordType" can't reproduce that faithfully).
-                $row = $this->buildFlexFormPointerRow($table, $fieldConfig, $data, $uid);
-                if ($row !== null) {
-                    try {
-                        $flexFormTools = GeneralUtility::makeInstance(FlexFormTools::class);
-                        $identifier = $flexFormTools->getDataStructureIdentifier($fieldConfig, $table, $fieldName, $row);
-                        $xmlArray = $flexFormTools->parseDataStructureByIdentifier($identifier);
-                    } catch (\Throwable) {
-                        $xmlArray = null;
-                    }
+        $nodes = [];
+        foreach (($parsed['data'] ?? []) as $sheetKey => $languages) {
+            // A sheet without fields is parsed as 'lDEF' => '' (empty string,
+            // not an array) by xml2array — same guard as TYPO3 core's
+            // FlexFormService::convertFlexFormContentToArray().
+            if (!is_array($languages['lDEF'] ?? false)) {
+                continue;
+            }
+            foreach ($languages['lDEF'] as $flatKey => $node) {
+                if (is_array($node)) {
+                    $nodes[(string)$flatKey] = [
+                        'sheet' => (string)$sheetKey,
+                        'node' => $node,
+                    ];
                 }
             }
         }
 
-        if (!is_array($xmlArray)) {
-            return [];
+        return $nodes;
+    }
+
+    /**
+     * Build the stored node of a FlexForm section from its JSON form: a list
+     * of items, in the shape ReadTable returns them. An item is
+     * {"<container>": {"<subfield>": value}}, or {"<subfield>": value} when
+     * the section's only container is `_arrayContainer` (ext:form).
+     *
+     * The list replaces the stored items completely and in the given order.
+     * Item ids mean nothing to the client, so the stored ids are reused by
+     * position — the workspace diff then shows only the items that changed —
+     * and additional items get new ids.
+     *
+     * @param array<string, array<string, mixed>> $containers container name => subfield name => subfield config
+     * @param array<string, mixed> $currentNode stored node of the section, [] when there is none
+     * @return array{el: array<string, array<string, mixed>>}
+     */
+    protected function buildSectionNode(
+        string $location,
+        string $sectionKey,
+        mixed $items,
+        array $containers,
+        array $currentNode
+    ): array {
+        $structureService = GeneralUtility::makeInstance(FlexFormStructureService::class);
+        $omitsContainerName = $structureService->itemsOmitTheContainerName($containers);
+        $section = "FlexForm section \"$sectionKey\" of $location";
+
+        if (!is_array($items) || !array_is_list($items)) {
+            throw new ValidationException([
+                "$section must be a JSON list of items, each "
+                . ($omitsContainerName
+                    ? '{"<subfield>": "<value>"}'
+                    : '{"<container>": {"<subfield>": "<value>"}}')
+                . '. The list replaces all stored items; an empty list removes them.',
+            ]);
         }
 
-        $fieldSheets = [];
-        if (isset($xmlArray['sheets']) && is_array($xmlArray['sheets'])) {
-            foreach ($xmlArray['sheets'] as $sheetName => $sheet) {
-                foreach (array_keys($sheet['ROOT']['el'] ?? []) as $dsFieldName) {
-                    $fieldSheets[$dsFieldName] = (string)$sheetName;
+        $storedIds = is_array($currentNode['el'] ?? null) ? array_keys($currentNode['el']) : [];
+        $elements = [];
+        foreach ($items as $position => $item) {
+            if (!is_array($item)) {
+                throw new ValidationException(["Item $position of $section must be a JSON object."]);
+            }
+
+            if ($omitsContainerName) {
+                $containerName = FlexFormStructureService::ANONYMOUS_CONTAINER;
+                $subValues = $item;
+            } else {
+                if (count($item) !== 1) {
+                    throw new ValidationException([
+                        "Item $position of $section must name exactly one container: "
+                        . implode(', ', array_keys($containers)),
+                    ]);
+                }
+                $containerName = (string)array_key_first($item);
+                $subValues = $item[$containerName];
+                if (!isset($containers[$containerName])) {
+                    throw new ValidationException([
+                        "Unknown container \"$containerName\" in item $position of $section. "
+                        . 'Available containers: ' . implode(', ', array_keys($containers)),
+                    ]);
+                }
+                if (!is_array($subValues)) {
+                    throw new ValidationException([
+                        "Container \"$containerName\" in item $position of $section must be a JSON object of subfields.",
+                    ]);
                 }
             }
-        } elseif (isset($xmlArray['ROOT']['el'])) {
-            foreach (array_keys($xmlArray['ROOT']['el']) as $dsFieldName) {
-                $fieldSheets[$dsFieldName] = 'sDEF';
+
+            $subfieldNodes = [];
+            foreach ($subValues as $subfieldName => $subfieldValue) {
+                if (!isset($containers[$containerName][$subfieldName])) {
+                    throw new ValidationException([
+                        "Unknown subfield \"$subfieldName\" in item $position of $section. "
+                        . 'Available subfields: ' . implode(', ', array_keys($containers[$containerName])),
+                    ]);
+                }
+                if (!is_scalar($subfieldValue)) {
+                    throw new ValidationException([
+                        "Subfield \"$subfieldName\" in item $position of $section must be a scalar value.",
+                    ]);
+                }
+                $subfieldNodes[(string)$subfieldName] = ['vDEF' => $subfieldValue];
             }
+
+            $itemId = (string)($storedIds[$position] ?? StringUtility::getUniqueId());
+            $elements[$itemId] = [$containerName => ['el' => $subfieldNodes]];
         }
 
-        return $fieldSheets;
+        return ['el' => $elements];
     }
 
-    /**
-     * Load a FlexForm DataStructure value (a `ds`/columnsOverrides entry)
-     * into its parsed array form, resolving a "FILE:" reference first.
-     * Returns null when the value can't be resolved to an array (missing
-     * file, invalid XML).
-     */
-    protected function loadFlexFormDataStructure(string|array $dsValue): ?array
-    {
-        if (is_array($dsValue)) {
-            return $dsValue;
-        }
 
-        if (str_starts_with($dsValue, 'FILE:')) {
-            $file = GeneralUtility::getFileAbsFileName(substr($dsValue, 5));
-            if (empty($file) || !file_exists($file)) {
-                return null;
-            }
-            $dsValue = file_get_contents($file);
-            if ($dsValue === false) {
-                return null;
-            }
-        }
 
-        $xmlArray = GeneralUtility::xml2array($dsValue);
-        return is_array($xmlArray) ? $xmlArray : null;
-    }
 
-    /**
-     * Build the row TYPO3's FlexFormTools needs to resolve a `ds_pointerField`
-     * DataStructure: the value of each pointer field (one or two, per TCA),
-     * preferring the value in $data, then the existing record, then falling
-     * back to the field's TCA-declared default (what a fresh record gets for
-     * any column the write doesn't mention). Returns null only when the
-     * field has no `ds_pointerField` configured at all.
-     */
-    protected function buildFlexFormPointerRow(string $table, array $fieldConfig, array $data, ?int $uid): ?array
-    {
-        $pointerFieldConfig = $fieldConfig['config']['ds_pointerField'] ?? null;
-        if (!is_string($pointerFieldConfig) || $pointerFieldConfig === '') {
-            return null;
-        }
-
-        $existingRecord = null;
-        $row = ['uid' => $uid ?? 0];
-        foreach (GeneralUtility::trimExplode(',', $pointerFieldConfig, true) as $pointerField) {
-            if (isset($data[$pointerField]) && is_string($data[$pointerField])) {
-                $row[$pointerField] = $data[$pointerField];
-                continue;
-            }
-            if ($existingRecord === null) {
-                $existingRecord = $uid !== null ? (BackendUtility::getRecord($table, $uid) ?: []) : [];
-            }
-            if (isset($existingRecord[$pointerField])) {
-                $row[$pointerField] = (string)$existingRecord[$pointerField];
-                continue;
-            }
-            // New record, and this pointer field isn't part of the current
-            // write: fall back to its TCA-declared default (e.g. "" for
-            // list_type) — the value DataHandler itself persists for a
-            // column the write never mentions.
-            $row[$pointerField] = (string)($GLOBALS['TCA'][$table]['columns'][$pointerField]['config']['default'] ?? '');
-        }
-
-        return $row;
-    }
 
     /**
      * For translation records, set l10n_state to "custom" for fields that

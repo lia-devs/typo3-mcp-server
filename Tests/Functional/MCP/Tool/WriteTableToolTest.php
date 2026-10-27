@@ -1261,10 +1261,12 @@ class WriteTableToolTest extends AbstractFunctionalTest
             'data' => [
                 ...$this->buildPluginContentRow('news_pi1'),
                 'header' => 'Plugin with FlexForm',
+                // Fields the news DataStructure declares: undeclared FlexForm
+                // fields are rejected with an explicit error
                 'pi_flexform' => [
                     'settings' => [
-                        'caption' => 'Plugin Caption',
-                        'headerPosition' => 'top'
+                        'orderBy' => 'title',
+                        'limit' => '5'
                     ]
                 ]
             ]
