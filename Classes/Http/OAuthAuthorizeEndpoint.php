@@ -143,8 +143,10 @@ class OAuthAuthorizeEndpoint
         // LoginProviderResolver discarded it and fell back to the be_lastLoginProvider cookie
         // and then to the primary provider anyway. Omitting it is behaviourally identical and
         // lets an SSO-only installation put the user on its own provider directly.
+        // "/typo3/" rather than "/typo3/index.php": TYPO3 14 serves the backend through
+        // the main index.php, and typo3/index.php no longer exists there (#147).
         $loginUrl = $this->getRequestSitePath($request)
-            . '/typo3/index.php?login_status=login'
+            . '/typo3/?login_status=login'
             . '&redirect=' . rawurlencode(OAuthResumeController::ROUTE_NAME)
             . '&redirectParams=' . rawurlencode(http_build_query($pendingAuthorization));
 

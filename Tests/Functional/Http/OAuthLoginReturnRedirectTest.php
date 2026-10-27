@@ -63,7 +63,7 @@ class OAuthLoginReturnRedirectTest extends AbstractFunctionalTest
         self::assertSame(302, $response->getStatusCode());
 
         $location = $response->getHeaderLine('Location');
-        self::assertStringContainsString('/typo3/index.php', $location);
+        self::assertStringContainsString('/typo3/?login_status=login', $location);
         self::assertStringContainsString(
             'redirect=' . OAuthResumeController::ROUTE_NAME,
             $location,

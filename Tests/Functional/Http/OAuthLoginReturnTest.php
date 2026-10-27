@@ -51,7 +51,7 @@ class OAuthLoginReturnTest extends AbstractFunctionalTest
         $response = $this->callAuthorizeWithoutSession();
 
         self::assertSame(302, $response->getStatusCode());
-        self::assertStringContainsString('/typo3/index.php', $response->getHeaderLine('Location'));
+        self::assertStringContainsString('/typo3/?login_status=login', $response->getHeaderLine('Location'));
 
         $setCookie = $response->getHeaderLine('Set-Cookie');
         self::assertStringStartsWith(PendingAuthorizationCookie::NAME . '=', $setCookie);
