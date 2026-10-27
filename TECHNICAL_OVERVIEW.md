@@ -286,7 +286,7 @@ Relations are transparently resolved and can be set using simple syntax:
 - **Select relations**: Use comma-separated IDs or arrays
 - **Inline relations**: Provide as nested objects
 - **MM relations**: Handled automatically
-- **File references**: Created and updated as embedded inline records (reference existing `sys_file` UIDs via `uid_local`)
+- **File references**: Created and updated as embedded inline records (reference existing `sys_file` UIDs via `uid_local`); crops are checked against the crop variants of the parent field
 - **Bidirectional**: Updates both sides as needed
 
 ### Language Support

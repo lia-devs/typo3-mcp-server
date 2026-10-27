@@ -8,6 +8,7 @@ use TYPO3\CMS\Backend\Utility\BackendUtility;
 use TYPO3\CMS\Core\Utility\GeneralUtility;
 use TYPO3\CMS\Core\Localization\LanguageService;
 use TYPO3\CMS\Core\Localization\LanguageServiceFactory;
+use Hn\McpServer\Service\CropVariantService;
 use Hn\McpServer\Service\SelectItemResolver;
 use Hn\McpServer\Service\TableAccessService;
 use Hn\McpServer\Service\LanguageService as McpLanguageService;
@@ -199,6 +200,10 @@ class TcaFormattingUtility
                     $result .= " [embedded records from " . $foreignTable . " - write as: [";
                     $result .= self::generateMiniExample($foreignTable);
                     $result .= "]. Use GetTableSchema on " . $foreignTable . " for all fields.]";
+                    // Crop variants live on this field (overrideChildTca), not on the
+                    // child table, so this is the only place they can be shown.
+                    $cropVariantService = GeneralUtility::makeInstance(CropVariantService::class);
+                    $result .= $cropVariantService->describe($cropVariantService->resolveForChildren($config));
                 } else {
                     // Independent relation: LLM writes array of UIDs
                     $result .= " [relation to " . $foreignTable . " - write as array of UIDs, e.g. [12, 34]]";
@@ -213,6 +218,11 @@ class TcaFormattingUtility
                 }
                 break;
 
+
+            case 'imageManipulation':
+                $result .= " [crop variants and their ratios depend on the field the file is attached to"
+                    . " - see GetTableSchema of that parent table]";
+                break;
 
             case 'language':
                 // Special handling for language type fields (TYPO3 11.2+)

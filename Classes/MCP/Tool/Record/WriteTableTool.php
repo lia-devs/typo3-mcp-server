@@ -9,6 +9,7 @@ use Hn\McpServer\Event\AfterRecordWriteEvent;
 use Hn\McpServer\Event\BeforeRecordWriteEvent;
 use Hn\McpServer\Exception\DatabaseException;
 use Hn\McpServer\Exception\ValidationException;
+use Hn\McpServer\Service\CropVariantService;
 use Hn\McpServer\Service\InlineParentService;
 use Hn\McpServer\Service\LanguageService;
 use Mcp\Types\CallToolResult;
@@ -16,6 +17,8 @@ use Psr\EventDispatcher\EventDispatcherInterface;
 use TYPO3\CMS\Backend\Utility\BackendUtility;
 use TYPO3\CMS\Core\Configuration\FlexForm\FlexFormTools;
 use TYPO3\CMS\Core\DataHandling\DataHandler;
+use TYPO3\CMS\Core\Resource\FileInterface;
+use TYPO3\CMS\Core\Resource\ResourceFactory;
 use TYPO3\CMS\Core\Utility\GeneralUtility;
 use TYPO3\CMS\Core\Database\ConnectionPool;
 use TYPO3\CMS\Core\Database\Query\Restriction\DeletedRestriction;
@@ -28,6 +31,8 @@ class WriteTableTool extends AbstractRecordTool
 {
     protected LanguageService $languageService;
     protected InlineParentService $inlineParentService;
+    protected CropVariantService $cropVariantService;
+    protected ResourceFactory $resourceFactory;
 
     /**
      * Foreign fields of nested embedded children that still need to be pointed at their
@@ -42,6 +47,8 @@ class WriteTableTool extends AbstractRecordTool
         parent::__construct();
         $this->languageService = GeneralUtility::makeInstance(LanguageService::class);
         $this->inlineParentService = GeneralUtility::makeInstance(InlineParentService::class);
+        $this->cropVariantService = GeneralUtility::makeInstance(CropVariantService::class);
+        $this->resourceFactory = GeneralUtility::makeInstance(ResourceFactory::class);
     }
 
     /**
@@ -1426,8 +1433,115 @@ class WriteTableTool extends AbstractRecordTool
                 }
             }
         }
-        
+
+        // Crop values are checked before anything is written, against the variants of
+        // the field the file is attached to. The record type's field configuration is
+        // used because columnsOverrides may change the variants per type.
+        $cropErrors = [];
+        foreach ($data as $fieldName => $value) {
+            $parentField = $availableFields[$fieldName] ?? $this->tableAccessService->getFieldConfig($table, $fieldName);
+            $parentFieldConfig = $parentField['config'] ?? $parentField;
+            if (is_array($value) && in_array($parentFieldConfig['type'] ?? '', ['inline', 'file'], true)) {
+                array_push($cropErrors, ...$this->collectEmbeddedCropErrors($parentFieldConfig, $value, $fieldName));
+            }
+        }
+        if ($table === 'sys_file_reference') {
+            array_push($cropErrors, ...$this->collectFileReferenceCropErrors($data, $mergedRecord, $uid));
+        }
+        if ($cropErrors !== []) {
+            return 'Invalid crop: ' . implode('; ', $cropErrors);
+        }
+
         return true;
+    }
+
+    /**
+     * Crop problems in the embedded children a file or inline field is written with,
+     * including files on those children (e.g. on a Content Blocks Collection item).
+     *
+     * @param array $parentFieldConfig the field's `config`
+     * @param array $items the children as the caller sent them
+     * @param string $path location of the field for the messages, e.g. "assets"
+     * @return list<string>
+     */
+    protected function collectEmbeddedCropErrors(array $parentFieldConfig, array $items, string $path): array
+    {
+        $childTable = (string)($parentFieldConfig['foreign_table'] ?? '');
+        if ($childTable === '' || !$this->tableAccessService->isEmbeddedChildTable($childTable)) {
+            return [];
+        }
+        $cropVariantsByField = $this->cropVariantService->resolveForChildren($parentFieldConfig);
+
+        $errors = [];
+        foreach ($items as $index => $item) {
+            if (!is_array($item)) {
+                continue;
+            }
+            $itemPath = $path . '[' . $index . ']';
+            foreach ($cropVariantsByField as $cropField => $variants) {
+                if (!array_key_exists($cropField, $item)) {
+                    continue;
+                }
+                $file = $this->resolveReferencedFile($childTable, $item);
+                foreach ($this->cropVariantService->validate($item[$cropField], $variants, $file) as $message) {
+                    $errors[] = $itemPath . '.' . $cropField . ': ' . $message;
+                }
+            }
+            foreach ($item as $childField => $childValue) {
+                $childFieldConfig = $this->tableAccessService->getFieldConfig($childTable, (string)$childField)['config'] ?? [];
+                if (is_array($childValue) && in_array($childFieldConfig['type'] ?? '', ['inline', 'file'], true)) {
+                    array_push(
+                        $errors,
+                        ...$this->collectEmbeddedCropErrors($childFieldConfig, $childValue, $itemPath . '.' . $childField)
+                    );
+                }
+            }
+        }
+        return $errors;
+    }
+
+    /**
+     * Crop problems of a file reference written directly (table sys_file_reference).
+     * The variants are those of the field the reference belongs to.
+     *
+     * @return list<string>
+     */
+    protected function collectFileReferenceCropErrors(array $data, array $mergedRecord, ?int $uid): array
+    {
+        $parentTable = (string)($mergedRecord['tablenames'] ?? '');
+        $parentFieldName = (string)($mergedRecord['fieldname'] ?? '');
+        $parentUid = (int)($mergedRecord['uid_foreign'] ?? 0);
+        if ($parentTable === '' || $parentFieldName === '' || $parentUid <= 0) {
+            return [];
+        }
+
+        $parentRecord = BackendUtility::getRecordWSOL($parentTable, $parentUid) ?? [];
+        $typeField = $this->tableAccessService->getTypeFieldName($parentTable);
+        $parentType = $typeField ? (string)($parentRecord[$typeField] ?? '') : '';
+        $parentField = $this->tableAccessService->getAvailableFields($parentTable, $parentType)[$parentFieldName]
+            ?? $this->tableAccessService->getFieldConfig($parentTable, $parentFieldName);
+        if (!is_array($parentField)) {
+            return [];
+        }
+
+        $reference = $uid !== null ? ['uid' => $uid] + $data : $data;
+        return $this->collectEmbeddedCropErrors($parentField['config'] ?? $parentField, [$reference], 'sys_file_reference');
+    }
+
+    /**
+     * The file a reference points to: the uid_local the caller sends, else the one
+     * stored on the existing reference. Null when neither is known.
+     */
+    protected function resolveReferencedFile(string $referenceTable, array $referenceData): ?FileInterface
+    {
+        $fileUid = $referenceData['uid_local'] ?? null;
+        if (!is_numeric($fileUid) && isset($referenceData['uid']) && is_numeric($referenceData['uid'])) {
+            $fileUid = BackendUtility::getRecordWSOL($referenceTable, (int)$referenceData['uid'], 'uid_local')['uid_local'] ?? null;
+        }
+        if (!is_numeric($fileUid) || (int)$fileUid <= 0) {
+            return null;
+        }
+        return $this->resourceFactory->getFileObject((int)$fileUid);
     }
     
     
@@ -1892,7 +2006,7 @@ class WriteTableTool extends AbstractRecordTool
                     unset($childData[$config['foreign_field']]);
                 }
 
-                $childData = $this->convertDataForStorage($foreignTable, $childData);
+                $childData = $this->convertDataForStorage($foreignTable, $childData, $existingUid);
 
                 if ($existingUid === null) {
                     $childData['pid'] = $pid;
@@ -2363,6 +2477,18 @@ class WriteTableTool extends AbstractRecordTool
             // back into an array) is symmetric.
             $fieldType = $fieldConfig['config']['type'] ?? '';
             if ($fieldType === 'imageManipulation' && is_array($value)) {
+                // The value is keyed by crop variant. Variants the caller did not send
+                // keep their stored crop; replacing the whole value would silently reset
+                // them to the full image.
+                if ($uid !== null) {
+                    $storedValue = BackendUtility::getRecordWSOL($table, $uid, $fieldName)[$fieldName] ?? '';
+                    $storedVariants = is_string($storedValue) && $storedValue !== ''
+                        ? json_decode($storedValue, true)
+                        : [];
+                    if (is_array($storedVariants)) {
+                        $value = array_replace($storedVariants, $value);
+                    }
+                }
                 $data[$fieldName] = json_encode($value, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
                 continue;
             }

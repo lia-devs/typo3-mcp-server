@@ -146,6 +146,20 @@ $writeTool->execute([
 - `sys_file` itself is read-only - files are managed through the filesystem, not direct DB edits
 - New files are created with the `UploadFile` tool (from a URL, a YouTube/Vimeo link, text content,
   or a pre-signed upload); the resulting `sys_file` uid is then referenced via `uid_local`
+- Crops (`crop`, TCA `type=imageManipulation`) are read and written as an object keyed by crop
+  variant: `{"default": {"cropArea": {"x": 0, "y": 0.0062, "width": 1, "height": 0.9876},
+  "selectedRatio": "landscape"}}`, coordinates relative (0–1) to the original image.
+  `CropVariantService` resolves the variants the way the backend crop editor does: from the
+  parent field's `overrideChildTca` (where Content Blocks puts `cropVariants`) with the parent
+  record type's `columnsOverrides` applied, falling back to the core default variant.
+  `GetTableSchema` lists them on the parent's file field.
+- `WriteTable` rejects a crop before writing anything when it names an unknown or disabled
+  variant or ratio, leaves the 0–1 range, or does not have the selected ratio's pixel
+  proportion (0.5 % tolerance, skipped when the file has no extracted dimensions); the message
+  proposes the largest matching area around the same center. TYPO3 itself never rejects a
+  crop: `CropVariantCollection::create()` turns a malformed value into "no crop" and maps an
+  unknown variant onto the next configured one.
+- Updating a crop replaces only the variants sent; the others keep their stored crop
 
 ### 3. Automatic Workspace Handling
 - Both ReadTableTool and WriteTableTool automatically initialize workspace context via `WorkspaceContextService`

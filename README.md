@@ -59,7 +59,7 @@ All these operations happen safely in workspaces, giving you full control to rev
 | **Record Reading/Writing**      | ✅ Ready         | Read and write any workspace-capable TYPO3 table (core & extensions) with full schema inspection |
 | **Content Translation**         | ⚠️ Experimental | Implemented, needs real-world testing |
 | **File Upload**                 | ✅ Ready         | From a URL, a YouTube/Vimeo link, raw text content, or a local file via single-use upload URL. Create-only: never overwrites or deletes, identical content is detected, executable files are refused |
-| **File Discovery & References** | ⚠️ Partial      | Browse `sys_file` and metadata within the user's file mounts (incl. public URLs), edit metadata, create file references. No visual or semantic image search yet |
+| **File Discovery & References** | ⚠️ Partial      | Browse `sys_file` and metadata within the user's file mounts (incl. public URLs), edit metadata, create file references and crop them to the variants of their field. No visual or semantic image search yet |
 | **Workspace Selection**         | ❌ Missing       | Currently uses the first writable workspace of the user |
 
 While there are a lot of automated tests, TYPO3 instances are widely different and Language Models are also widely different. Feel free to [create issues here on GitHub](https://github.com/logiscape/mcp-sdk-php/issues) or [share experiences in the typo3-core-ai channel](https://typo3.slack.com/archives/C091M0M7BL6). 
