@@ -19,6 +19,7 @@ use Psr\Http\Message\ServerRequestInterface;
 use Psr\Http\Server\MiddlewareInterface;
 use Psr\Http\Server\RequestHandlerInterface;
 use TYPO3\CMS\Core\Context\Context;
+use TYPO3\CMS\Core\Core\SystemEnvironmentBuilder;
 use TYPO3\CMS\Core\Http\Response;
 use TYPO3\CMS\Core\Http\Stream;
 use TYPO3\CMS\Core\Utility\GeneralUtility;
@@ -63,7 +64,18 @@ class McpServerMiddleware implements MiddlewareInterface
         // RequestHandler that usually publishes the request never runs for them.
         // It is registered after normalized-params-attribute, so the request
         // carries the attributes those APIs expect.
+        //
+        // The request is published as a backend request. The tools act as a
+        // backend user on backend data, but the routes are usually reached
+        // through the frontend stack, before the site and TypoScript
+        // middlewares. A frontend request without frontend TypoScript breaks
+        // code that branches on the application type: an Extbase query in a
+        // DataHandler hook (a cache extension looking up the tags to flush
+        // after every write, for instance) asks the FrontendConfigurationManager
+        // for TypoScript and gets RuntimeException 1700841298 - after
+        // DataHandler has saved the record.
         if (in_array($path, ['/mcp', '/mcp/upload', '/mcp_upload'], true)) {
+            $request = $request->withAttribute('applicationType', SystemEnvironmentBuilder::REQUESTTYPE_BE);
             $GLOBALS['TYPO3_REQUEST'] = $request;
         }
 
