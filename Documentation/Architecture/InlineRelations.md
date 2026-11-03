@@ -102,6 +102,18 @@ For independent relations, each item of the array is one of:
 
 On update the list replaces the linked records: records left out are unlinked, not deleted.
 
+The foreign field is often no TCA column of the child table: TYPO3 sets it through
+RelationHandler, never through the child's form, and DataHandler silently drops a field it has
+no column for. `writeIndependentForeignField()` therefore uses DataHandler only when the field
+is a column. Otherwise it writes the field directly on the row the workspace sees: the record
+itself if it was created in the workspace, else its workspace version, created first with the
+same `version/new` command a backend form save issues. Live stays untouched until publishing.
+
+Linking a live child to another parent changes its foreign field in the workspace version only.
+`WorkspaceRestriction` selects no plain versions, so ReadTable additionally looks up the
+versions whose foreign field points at the parent and adds their live rows before the workspace
+overlay (`fetchChildrenLinkedInWorkspaceOnly()`).
+
 ```php
 // Keep 456, patch 789, create a new content element
 $writeTool->execute([

@@ -2009,25 +2009,107 @@ class WriteTableTool extends AbstractRecordTool
             $this->pendingNestedForeignFields = $pendingNestedForeignFields;
         }
 
-        // Update foreign field on specified records
-        if (!empty($uids)) {
+        $this->writeIndependentForeignField(
+            $foreignTable,
+            $foreignField,
+            array_filter($uids, static fn(int $uid): bool => $uid > 0),
+            (int)($liveUid ?? $parentUid)
+        );
+    }
+
+    /**
+     * Point independent inline children at a parent; 0 detaches them.
+     *
+     * A foreign_field that is a TCA column of the child goes through DataHandler like any
+     * other field. Often it is none: TYPO3 itself sets it through RelationHandler, never
+     * through the child's form, and DataHandler silently drops a field it has no column
+     * for. Then the field is written directly on the row the workspace sees. A live child
+     * gets its workspace version first, with the command DataHandler issues when the
+     * backend saves a form, so live stays untouched until publishing.
+     *
+     * @param list<int> $childUids live uids of the children
+     */
+    protected function writeIndependentForeignField(string $foreignTable, string $foreignField, array $childUids, int $parentUid): void
+    {
+        if ($childUids === []) {
+            return;
+        }
+
+        if (isset($GLOBALS['TCA'][$foreignTable]['columns'][$foreignField])) {
+            $updateMap = [];
+            foreach ($childUids as $childUid) {
+                $updateMap[$foreignTable][$childUid] = [$foreignField => $parentUid];
+            }
             $dataHandler = GeneralUtility::makeInstance(DataHandler::class);
             $dataHandler->BE_USER = $GLOBALS['BE_USER'];
-
-            $updateMap = [];
-            foreach ($uids as $uid) {
-                if ($uid > 0) {
-                    $updateMap[$foreignTable][$uid] = [
-                        $foreignField => $liveUid ?? $parentUid
-                    ];
-                }
-            }
-
-            if (!empty($updateMap)) {
-                $dataHandler->start($updateMap, []);
-                $dataHandler->process_datamap();
-            }
+            $dataHandler->start($updateMap, []);
+            $dataHandler->process_datamap();
+            return;
         }
+
+        if (!$GLOBALS['BE_USER']->check('tables_modify', $foreignTable)) {
+            throw new ValidationException(["No permission to modify $foreignTable, the inline children cannot be linked."]);
+        }
+
+        $workspaceId = (int)($GLOBALS['BE_USER']->workspace ?? 0);
+        $versioned = $workspaceId !== 0 && BackendUtility::isTableWorkspaceEnabled($foreignTable);
+        $connection = GeneralUtility::makeInstance(ConnectionPool::class)->getConnectionForTable($foreignTable);
+        foreach ($childUids as $childUid) {
+            $rowUid = $versioned ? $this->getWorkspaceRowUid($foreignTable, $childUid, $workspaceId) : $childUid;
+            $connection->update($foreignTable, [$foreignField => $parentUid], ['uid' => $rowUid]);
+        }
+    }
+
+    /**
+     * The row of a record the workspace sees: the record itself if it was created in the
+     * workspace, else its workspace version, created first if there is none yet.
+     *
+     * Queried directly: BackendUtility caches workspace versions per request, so it would
+     * still name the live row right after the version has been created.
+     */
+    protected function getWorkspaceRowUid(string $table, int $liveUid, int $workspaceId): int
+    {
+        $row = BackendUtility::getRecord($table, $liveUid, 't3ver_wsid');
+        if (is_array($row) && (int)$row['t3ver_wsid'] === $workspaceId) {
+            return $liveUid;
+        }
+
+        $versionUid = $this->findWorkspaceVersionUid($table, $liveUid, $workspaceId);
+        if ($versionUid !== null) {
+            return $versionUid;
+        }
+
+        $dataHandler = GeneralUtility::makeInstance(DataHandler::class);
+        $dataHandler->BE_USER = $GLOBALS['BE_USER'];
+        $dataHandler->start([], [
+            $table => [
+                $liveUid => ['version' => ['action' => 'new', 'label' => 'Auto-created for WS #' . $workspaceId]],
+            ],
+        ]);
+        $dataHandler->process_cmdmap();
+        $versionUid = $this->findWorkspaceVersionUid($table, $liveUid, $workspaceId);
+        if ($versionUid === null) {
+            throw new ValidationException([
+                "Record $table:$liveUid cannot be versioned in the workspace: " . implode(', ', $dataHandler->errorLog),
+            ]);
+        }
+        return $versionUid;
+    }
+
+    protected function findWorkspaceVersionUid(string $table, int $liveUid, int $workspaceId): ?int
+    {
+        $queryBuilder = GeneralUtility::makeInstance(ConnectionPool::class)->getQueryBuilderForTable($table);
+        $queryBuilder->getRestrictions()->removeAll()->add(GeneralUtility::makeInstance(DeletedRestriction::class));
+        $versionUid = $queryBuilder
+            ->select('uid')
+            ->from($table)
+            ->where(
+                $queryBuilder->expr()->eq('t3ver_oid', $queryBuilder->createNamedParameter($liveUid, ParameterType::INTEGER)),
+                $queryBuilder->expr()->eq('t3ver_wsid', $queryBuilder->createNamedParameter($workspaceId, ParameterType::INTEGER))
+            )
+            ->executeQuery()
+            ->fetchOne();
+        return $versionUid === false ? null : (int)$versionUid;
     }
 
     /**
@@ -2057,31 +2139,20 @@ class WriteTableTool extends AbstractRecordTool
             ->add(GeneralUtility::makeInstance(WorkspaceRestriction::class, $GLOBALS['BE_USER']->workspace ?? 0));
         
         $existingRecords = $queryBuilder
-            ->select('uid')
+            ->select('uid', 't3ver_oid')
             ->from($foreignTable)
             ->where(
                 $queryBuilder->expr()->eq($foreignField, $queryBuilder->createNamedParameter($parentUid, ParameterType::INTEGER))
             )
             ->executeQuery()
             ->fetchAllAssociative();
-        
-        if (!empty($existingRecords)) {
-            // Use DataHandler to clear relations to respect workspaces
-            $dataHandler = GeneralUtility::makeInstance(DataHandler::class);
-            $dataHandler->BE_USER = $GLOBALS['BE_USER'];
-            
-            $updateMap = [];
-            foreach ($existingRecords as $record) {
-                $updateMap[$foreignTable][$record['uid']] = [
-                    $foreignField => 0
-                ];
-            }
-            
-            if (!empty($updateMap)) {
-                $dataHandler->start($updateMap, []);
-                $dataHandler->process_datamap();
-            }
-        }
+
+        // A workspace version stands for its live record.
+        $childUids = array_values(array_unique(array_map(
+            static fn(array $record): int => (int)$record['t3ver_oid'] > 0 ? (int)$record['t3ver_oid'] : (int)$record['uid'],
+            $existingRecords
+        )));
+        $this->writeIndependentForeignField($foreignTable, $foreignField, $childUids, 0);
     }
     
     /**
