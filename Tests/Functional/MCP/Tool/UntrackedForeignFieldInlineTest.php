@@ -99,7 +99,6 @@ class UntrackedForeignFieldInlineTest extends FunctionalTestCase
             'action' => 'update',
             'uid' => self::PARENT_UID,
             'data' => [
-                // Independent children keep their own sorting; listed here in that order.
                 'tx_testuntrackedforeignfield_items' => [
                     self::LINKED_CHILD_UID,
                     self::DETACHED_CHILD_UID,
@@ -113,6 +112,29 @@ class UntrackedForeignFieldInlineTest extends FunctionalTestCase
             $this->readChildUids(self::PARENT_UID)
         );
         $this->assertSame(0, $this->getLiveParentPointer(self::DETACHED_CHILD_UID));
+    }
+
+    public function testListOrderBecomesTheOrderOfTheChildren(): void
+    {
+        $this->write([
+            'table' => 'tt_content',
+            'action' => 'update',
+            'uid' => self::PARENT_UID,
+            'data' => [
+                'tx_testuntrackedforeignfield_items' => [
+                    self::SECOND_LINKED_CHILD_UID,
+                    ['title' => 'New teaser'],
+                    self::LINKED_CHILD_UID,
+                ],
+            ],
+        ]);
+
+        $childUids = $this->readChildUids(self::PARENT_UID);
+        $this->assertSame(
+            ['Live teaser ' . self::SECOND_LINKED_CHILD_UID, 'New teaser', 'Live teaser ' . self::LINKED_CHILD_UID],
+            array_map(fn(int $uid): string => $this->readChild($uid)['title'], $childUids)
+        );
+        $this->assertSame(self::LINKED_CHILD_UID * 256, $this->getLiveSorting(self::LINKED_CHILD_UID));
     }
 
     public function testOmittedChildIsDetachedInTheWorkspaceOnly(): void
@@ -163,11 +185,21 @@ class UntrackedForeignFieldInlineTest extends FunctionalTestCase
 
     private function getLiveParentPointer(int $childUid): int
     {
+        return $this->getLiveField($childUid, 'content_element');
+    }
+
+    private function getLiveSorting(int $childUid): int
+    {
+        return $this->getLiveField($childUid, 'sorting');
+    }
+
+    private function getLiveField(int $childUid, string $field): int
+    {
         $queryBuilder = GeneralUtility::makeInstance(ConnectionPool::class)
             ->getQueryBuilderForTable('tx_testuntrackedforeignfield_item');
         $queryBuilder->getRestrictions()->removeAll();
         return (int)$queryBuilder
-            ->select('content_element')
+            ->select($field)
             ->from('tx_testuntrackedforeignfield_item')
             ->where($queryBuilder->expr()->eq('uid', $queryBuilder->createNamedParameter($childUid)))
             ->executeQuery()

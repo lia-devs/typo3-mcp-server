@@ -1536,7 +1536,7 @@ class WriteTableTool extends AbstractRecordTool
                 ];
             } else {
                 // Process independent inline relations (e.g., tt_content)
-                $this->processIndependentInlineRelations($foreignTable, $foreignField, $parentUid, $pid, $value, $liveUid);
+                $this->processIndependentInlineRelations($foreignTable, $foreignField, $config['foreign_sortby'] ?? null, $parentUid, $pid, $value, $liveUid);
             }
         }
 
@@ -1965,11 +1965,12 @@ class WriteTableTool extends AbstractRecordTool
      * Each item is a UID to link, {"uid": N, ...} to link and patch that record, or record
      * data for a new record. New and patched records go through createRecord() and
      * updateRecord(), so they are validated like any other write and may carry inline
-     * fields of their own.
+     * fields of their own. The list order becomes the children's order (foreign_sortby).
      */
     protected function processIndependentInlineRelations(
         string $foreignTable,
         string $foreignField,
+        ?string $sortbyField,
         $parentUid,
         int $pid,
         array $items,
@@ -2013,37 +2014,63 @@ class WriteTableTool extends AbstractRecordTool
             $foreignTable,
             $foreignField,
             array_filter($uids, static fn(int $uid): bool => $uid > 0),
-            (int)($liveUid ?? $parentUid)
+            (int)($liveUid ?? $parentUid),
+            $sortbyField
         );
     }
 
     /**
      * Point independent inline children at a parent; 0 detaches them.
      *
-     * A foreign_field that is a TCA column of the child goes through DataHandler like any
-     * other field. Often it is none: TYPO3 itself sets it through RelationHandler, never
-     * through the child's form, and DataHandler silently drops a field it has no column
-     * for. Then the field is written directly on the row the workspace sees. A live child
-     * gets its workspace version first, with the command DataHandler issues when the
-     * backend saves a form, so live stays untouched until publishing.
+     * With a sortby field the children are numbered 1, 2, 3 … in list order, as
+     * RelationHandler::writeForeignField() does when the backend saves the parent's form.
      *
-     * @param list<int> $childUids live uids of the children
+     * Fields that are TCA columns of the child go through DataHandler like any other
+     * field. Often they are none: TYPO3 itself sets the foreign field (and the sortby
+     * field, when it is only ctrl.sortby) through RelationHandler, never through the
+     * child's form, and DataHandler silently drops a field it has no column for. Those
+     * are written directly on the row the workspace sees. A live child gets its workspace
+     * version first, with the command DataHandler issues when the backend saves a form,
+     * so live stays untouched until publishing.
+     *
+     * @param list<int> $childUids live uids of the children, in display order
+     * @param string|null $sortbyField the relation's foreign_sortby; null leaves the order alone
      */
-    protected function writeIndependentForeignField(string $foreignTable, string $foreignField, array $childUids, int $parentUid): void
-    {
+    protected function writeIndependentForeignField(
+        string $foreignTable,
+        string $foreignField,
+        array $childUids,
+        int $parentUid,
+        ?string $sortbyField = null
+    ): void {
         if ($childUids === []) {
             return;
         }
 
-        if (isset($GLOBALS['TCA'][$foreignTable]['columns'][$foreignField])) {
-            $updateMap = [];
-            foreach ($childUids as $childUid) {
-                $updateMap[$foreignTable][$childUid] = [$foreignField => $parentUid];
+        $columns = $GLOBALS['TCA'][$foreignTable]['columns'] ?? [];
+        $updateMap = [];
+        $directFields = [];
+        foreach (array_values($childUids) as $position => $childUid) {
+            $fields = [$foreignField => $parentUid];
+            if ($sortbyField !== null) {
+                $fields[$sortbyField] = $position + 1;
             }
+            foreach ($fields as $field => $value) {
+                if (isset($columns[$field])) {
+                    $updateMap[$foreignTable][$childUid][$field] = $value;
+                } else {
+                    $directFields[$childUid][$field] = $value;
+                }
+            }
+        }
+
+        if ($updateMap !== []) {
             $dataHandler = GeneralUtility::makeInstance(DataHandler::class);
             $dataHandler->BE_USER = $GLOBALS['BE_USER'];
             $dataHandler->start($updateMap, []);
             $dataHandler->process_datamap();
+        }
+        if ($directFields === []) {
             return;
         }
 
@@ -2054,9 +2081,9 @@ class WriteTableTool extends AbstractRecordTool
         $workspaceId = (int)($GLOBALS['BE_USER']->workspace ?? 0);
         $versioned = $workspaceId !== 0 && BackendUtility::isTableWorkspaceEnabled($foreignTable);
         $connection = GeneralUtility::makeInstance(ConnectionPool::class)->getConnectionForTable($foreignTable);
-        foreach ($childUids as $childUid) {
+        foreach ($directFields as $childUid => $fields) {
             $rowUid = $versioned ? $this->getWorkspaceRowUid($foreignTable, $childUid, $workspaceId) : $childUid;
-            $connection->update($foreignTable, [$foreignField => $parentUid], ['uid' => $rowUid]);
+            $connection->update($foreignTable, $fields, ['uid' => $rowUid]);
         }
     }
 

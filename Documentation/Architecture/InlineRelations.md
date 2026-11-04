@@ -226,6 +226,12 @@ version rows remain.
 
 ### 5. Sorting and Positioning
 - Sorting is handled through `sorting` or `sorting_foreign` fields
+- The array order of an inline field is the children's order. Embedded children get
+  `foreign_sortby` 256, 512, …; independent children are numbered 1, 2, 3 … like
+  `RelationHandler::writeForeignField()` does on a backend form save, written on the row
+  the workspace sees (also when the sortby field is `ctrl.sortby` only, not a column).
+  `ReadTable` orders inline children by the workspace values after the overlay, so a
+  reorder shows before publishing.
 - Position management (before/after) not fully implemented for inline relations
 
 ## Best Practices

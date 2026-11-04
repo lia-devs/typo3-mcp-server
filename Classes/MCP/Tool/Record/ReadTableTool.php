@@ -1053,8 +1053,10 @@ class ReadTableTool extends AbstractRecordTool
         $records = $queryBuilder->executeQuery()->fetchAllAssociative();
         $linkedInWorkspaceOnly = $this->fetchChildrenLinkedInWorkspaceOnly($table, $foreignField, $parentUids, $foreignMatchFields, $records);
         $records = $this->applyWorkspaceOverlay($table, [...$records, ...$linkedInWorkspaceOnly]);
-        // Those rows were not part of the sorted query; order them in with the workspace values.
-        if ($linkedInWorkspaceOnly !== [] && $foreignSortBy !== '') {
+        // The query sorted by the live values. A workspace version may carry its own
+        // (children reordered through their parent), and the rows linked in the workspace
+        // only were not part of the query at all: order by the workspace values.
+        if ($foreignSortBy !== '') {
             usort($records, static fn(array $a, array $b): int => [(int)($a[$foreignSortBy] ?? 0), (int)$a['uid']] <=> [(int)($b[$foreignSortBy] ?? 0), (int)$b['uid']]);
         }
 
