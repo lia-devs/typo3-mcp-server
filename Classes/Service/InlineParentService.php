@@ -282,9 +282,12 @@ class InlineParentService
     }
 
     /**
+     * Inline relations with a foreign_field of workspace-aware children, from the base
+     * TCA columns (columnsOverrides and overrideChildTca are not applied).
+     *
      * @return list<array{parentTable: string, childTable: string, foreignField: string, foreignTableField: ?string, foreignMatchFields: array<string, mixed>}>
      */
-    protected function getRelations(): array
+    public function getRelations(): array
     {
         if ($this->relations !== null) {
             return $this->relations;

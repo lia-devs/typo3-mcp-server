@@ -10,6 +10,7 @@ use Hn\McpServer\Event\BeforeRecordWriteEvent;
 use Hn\McpServer\Exception\DatabaseException;
 use Hn\McpServer\Exception\ValidationException;
 use Hn\McpServer\Service\CropVariantService;
+use Hn\McpServer\Service\InlineFieldConfigService;
 use Hn\McpServer\Service\InlineParentService;
 use Hn\McpServer\Service\LanguageService;
 use Mcp\Types\CallToolResult;
@@ -29,10 +30,28 @@ use TYPO3\CMS\Core\Database\Query\Restriction\WorkspaceRestriction;
  */
 class WriteTableTool extends AbstractRecordTool
 {
+    /**
+     * Appended to crop errors on a record whose crop variants may be set by an inline
+     * parent element it is not linked to (yet), e.g. a new lia_ctypes teaser item.
+     */
+    protected const CROP_NEEDS_INLINE_PARENT_HINT = 'The crop variants of this record can depend on the element it '
+        . 'belongs to, and it is not linked to one yet. Create it through the inline field of its parent element, '
+        . 'or link it there first (by uid), then set the crop.';
+
     protected LanguageService $languageService;
     protected InlineParentService $inlineParentService;
     protected CropVariantService $cropVariantService;
+    protected InlineFieldConfigService $inlineFieldConfigService;
     protected ResourceFactory $resourceFactory;
+
+    /**
+     * The parent field configuration of independent children while they are written
+     * through their parent's inline field, keyed by child table. The link to the parent
+     * is only written after the children, so it can't be read from the database yet.
+     *
+     * @var array<string, array>
+     */
+    protected array $independentChildParentFieldConfigs = [];
 
     /**
      * Foreign fields of nested embedded children that still need to be pointed at their
@@ -48,6 +67,7 @@ class WriteTableTool extends AbstractRecordTool
         $this->languageService = GeneralUtility::makeInstance(LanguageService::class);
         $this->inlineParentService = GeneralUtility::makeInstance(InlineParentService::class);
         $this->cropVariantService = GeneralUtility::makeInstance(CropVariantService::class);
+        $this->inlineFieldConfigService = GeneralUtility::makeInstance(InlineFieldConfigService::class);
         $this->resourceFactory = GeneralUtility::makeInstance(ResourceFactory::class);
     }
 
@@ -1439,23 +1459,59 @@ class WriteTableTool extends AbstractRecordTool
 
         // Crop values are checked before anything is written, against the variants of
         // the field the file is attached to. The record type's field configuration is
-        // used because columnsOverrides may change the variants per type.
+        // used because columnsOverrides may change the variants per type. A record in an
+        // inline field (e.g. a lia_ctypes teaser item) gets its field configuration from
+        // the parent element as well, through overrideChildTca up the inline chain.
         $cropErrors = [];
+        $inlineParentFieldConfig = $table === 'sys_file_reference'
+            ? null
+            : $this->resolveInlineParentFieldConfig($table, $uid);
         foreach ($data as $fieldName => $value) {
-            $parentField = $availableFields[$fieldName] ?? $this->tableAccessService->getFieldConfig($table, $fieldName);
-            $parentFieldConfig = $parentField['config'] ?? $parentField;
+            if ($inlineParentFieldConfig === null) {
+                $parentField = $availableFields[$fieldName] ?? $this->tableAccessService->getFieldConfig($table, $fieldName);
+                $parentFieldConfig = $parentField['config'] ?? $parentField;
+            } else {
+                $parentFieldConfig = $this->inlineFieldConfigService->applyParentOverrides($table, (string)$fieldName, $recordType, $inlineParentFieldConfig);
+            }
             if (is_array($value) && in_array($parentFieldConfig['type'] ?? '', ['inline', 'file'], true)) {
                 array_push($cropErrors, ...$this->collectEmbeddedCropErrors($parentFieldConfig, $value, $fieldName));
             }
         }
+        $lacksInlineParent = $inlineParentFieldConfig === null
+            && $table !== 'sys_file_reference'
+            && $this->cropVariantService->canComeFromInlineParent($table);
         if ($table === 'sys_file_reference') {
-            array_push($cropErrors, ...$this->collectFileReferenceCropErrors($data, $mergedRecord, $uid));
+            array_push($cropErrors, ...$this->collectFileReferenceCropErrors($data, $mergedRecord, $uid, $lacksInlineParent));
         }
         if ($cropErrors !== []) {
-            return 'Invalid crop: ' . implode('; ', $cropErrors);
+            return 'Invalid crop: ' . implode('; ', $cropErrors)
+                . ($lacksInlineParent ? '. ' . self::CROP_NEEDS_INLINE_PARENT_HINT : '');
         }
 
         return true;
+    }
+
+    /**
+     * The configuration of the inline field a record is written into or stored in, with
+     * everything the inline parents above pass down. Null when the record has no inline
+     * parent (yet).
+     */
+    protected function resolveInlineParentFieldConfig(string $table, ?int $uid): ?array
+    {
+        if (isset($this->independentChildParentFieldConfigs[$table])) {
+            return $this->independentChildParentFieldConfigs[$table];
+        }
+        if ($uid === null) {
+            return null;
+        }
+        $row = BackendUtility::getRecordWSOL($table, $uid);
+        if (!is_array($row)) {
+            return null;
+        }
+        $parent = $this->inlineFieldConfigService->findInlineParent($table, $row);
+        return $parent === null
+            ? null
+            : $this->inlineFieldConfigService->resolveFieldConfig($parent['table'], $parent['row'], $parent['field']);
     }
 
     /**
@@ -1490,8 +1546,10 @@ class WriteTableTool extends AbstractRecordTool
                     $errors[] = $itemPath . '.' . $cropField . ': ' . $message;
                 }
             }
+            // A file on a child may get its variants from this field's overrideChildTca.
+            $childRecordType = $this->inlineFieldConfigService->recordTypeOf($childTable, $item);
             foreach ($item as $childField => $childValue) {
-                $childFieldConfig = $this->tableAccessService->getFieldConfig($childTable, (string)$childField)['config'] ?? [];
+                $childFieldConfig = $this->inlineFieldConfigService->applyParentOverrides($childTable, (string)$childField, $childRecordType, $parentFieldConfig);
                 if (is_array($childValue) && in_array($childFieldConfig['type'] ?? '', ['inline', 'file'], true)) {
                     array_push(
                         $errors,
@@ -1505,11 +1563,14 @@ class WriteTableTool extends AbstractRecordTool
 
     /**
      * Crop problems of a file reference written directly (table sys_file_reference).
-     * The variants are those of the field the reference belongs to.
+     * The variants are those of the field the reference belongs to, including what the
+     * inline parents of the record with that field pass down.
      *
+     * @param bool $lacksInlineParent set to whether the variants could come from an
+     *        inline parent the record with the file field does not have (yet)
      * @return list<string>
      */
-    protected function collectFileReferenceCropErrors(array $data, array $mergedRecord, ?int $uid): array
+    protected function collectFileReferenceCropErrors(array $data, array $mergedRecord, ?int $uid, bool &$lacksInlineParent): array
     {
         $parentTable = (string)($mergedRecord['tablenames'] ?? '');
         $parentFieldName = (string)($mergedRecord['fieldname'] ?? '');
@@ -1518,17 +1579,19 @@ class WriteTableTool extends AbstractRecordTool
             return [];
         }
 
-        $parentRecord = BackendUtility::getRecordWSOL($parentTable, $parentUid) ?? [];
-        $typeField = $this->tableAccessService->getTypeFieldName($parentTable);
-        $parentType = $typeField ? (string)($parentRecord[$typeField] ?? '') : '';
-        $parentField = $this->tableAccessService->getAvailableFields($parentTable, $parentType)[$parentFieldName]
-            ?? $this->tableAccessService->getFieldConfig($parentTable, $parentFieldName);
-        if (!is_array($parentField)) {
+        $parentRecord = BackendUtility::getRecordWSOL($parentTable, $parentUid);
+        if (!is_array($parentRecord)) {
             return [];
         }
+        $parentFieldConfig = $this->inlineFieldConfigService->resolveFieldConfig($parentTable, $parentRecord, $parentFieldName);
+        if (!in_array($parentFieldConfig['type'] ?? '', ['inline', 'file'], true)) {
+            return [];
+        }
+        $lacksInlineParent = $this->cropVariantService->canComeFromInlineParent($parentTable)
+            && $this->inlineFieldConfigService->findInlineParent($parentTable, $parentRecord) === null;
 
         $reference = $uid !== null ? ['uid' => $uid] + $data : $data;
-        return $this->collectEmbeddedCropErrors($parentField['config'] ?? $parentField, [$reference], 'sys_file_reference');
+        return $this->collectEmbeddedCropErrors($parentFieldConfig, [$reference], 'sys_file_reference');
     }
 
     /**
@@ -1650,7 +1713,15 @@ class WriteTableTool extends AbstractRecordTool
                 ];
             } else {
                 // Process independent inline relations (e.g., tt_content)
-                $this->processIndependentInlineRelations($foreignTable, $foreignField, $config['foreign_sortby'] ?? null, $parentUid, $pid, $value, $liveUid);
+                $parentRow = BackendUtility::getRecordWSOL($parentTable, (int)($liveUid ?? $parentUid));
+                if (!is_array($parentRow)) {
+                    throw new \RuntimeException(
+                        sprintf('Inline parent %s:%d was not found after writing it', $parentTable, (int)($liveUid ?? $parentUid)),
+                        1762250002
+                    );
+                }
+                $parentFieldConfig = $this->inlineFieldConfigService->resolveFieldConfig($parentTable, $parentRow, (string)$fieldName);
+                $this->processIndependentInlineRelations($foreignTable, $foreignField, $config['foreign_sortby'] ?? null, $parentUid, $pid, $value, $parentFieldConfig, $liveUid);
             }
         }
 
@@ -2080,6 +2151,10 @@ class WriteTableTool extends AbstractRecordTool
      * data for a new record. New and patched records go through createRecord() and
      * updateRecord(), so they are validated like any other write and may carry inline
      * fields of their own. The list order becomes the children's order (foreign_sortby).
+     * They are validated with the parent field's configuration, whose overrideChildTca
+     * may change their fields (e.g. crop variants).
+     *
+     * @param array $parentFieldConfig the parent field's `config` as it applies to the parent record
      */
     protected function processIndependentInlineRelations(
         string $foreignTable,
@@ -2088,6 +2163,7 @@ class WriteTableTool extends AbstractRecordTool
         $parentUid,
         int $pid,
         array $items,
+        array $parentFieldConfig,
         ?int $liveUid = null
     ): void {
         // For updates, we need to handle existing relations
@@ -2111,15 +2187,23 @@ class WriteTableTool extends AbstractRecordTool
             // A nested write runs processInlineRelations() again, which starts a fresh
             // collection; the parent's own pending foreign fields must survive it.
             $pendingNestedForeignFields = $this->pendingNestedForeignFields;
-            if (isset($item['uid'])) {
-                $childUid = (int)$item['uid'];
-                unset($item['uid']);
-                if ($item !== []) {
-                    $this->requireChildWritten($this->updateRecord($foreignTable, $childUid, $item), $foreignTable, $index);
+            // The child is linked only after it is written, so its validation can't find
+            // the parent in the database; hand the parent field over instead.
+            $outerParentFieldConfigs = $this->independentChildParentFieldConfigs;
+            $this->independentChildParentFieldConfigs[$foreignTable] = $parentFieldConfig;
+            try {
+                if (isset($item['uid'])) {
+                    $childUid = (int)$item['uid'];
+                    unset($item['uid']);
+                    if ($item !== []) {
+                        $this->requireChildWritten($this->updateRecord($foreignTable, $childUid, $item), $foreignTable, $index);
+                    }
+                    $uids[] = $childUid;
+                } else {
+                    $uids[] = $this->requireChildWritten($this->createRecord($foreignTable, $pid, $item, 'bottom'), $foreignTable, $index);
                 }
-                $uids[] = $childUid;
-            } else {
-                $uids[] = $this->requireChildWritten($this->createRecord($foreignTable, $pid, $item, 'bottom'), $foreignTable, $index);
+            } finally {
+                $this->independentChildParentFieldConfigs = $outerParentFieldConfigs;
             }
             $this->pendingNestedForeignFields = $pendingNestedForeignFields;
         }

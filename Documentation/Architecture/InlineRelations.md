@@ -181,6 +181,20 @@ $writeTool->execute([
   parent field's `overrideChildTca` (where Content Blocks puts `cropVariants`) with the parent
   record type's `columnsOverrides` applied, falling back to the core default variant.
   `GetTableSchema` lists them on the parent's file field.
+- The variants may also be set further up the inline chain. lia_ctypes' static content teaser
+  sets them in `tt_content.types[<CType>].columnsOverrides.tx_liactypes_ctypes.config
+  .overrideChildTca.columns.image.config.overrideChildTca.columns.crop`: the file field
+  belongs to an independent child (`tx_liactypes_domain_model_ctypes`), its variants to the
+  element that child is linked to. `InlineFieldConfigService` rebuilds that chain the way
+  FormEngine hands it down (`InlineOverrideChildTca`, then `TcaColumnsOverrides`), level by
+  level: while `WriteTable` writes children through the parent's inline field, from the
+  parent field passed along; for a stored record (or a file reference on it), from its
+  foreign field, matching the parent field of the parent's record type (`foreign_field`,
+  `foreign_table_field`, `foreign_match_fields`). A record not linked to a parent yet only has
+  its own variants. When an inline parent could set them (some inline field to the table has
+  `cropVariants` in its `overrideChildTca`), the crop error tells the client to create the
+  record through the parent, or link it first. `GetTableSchema` of the child table still
+  lists only the child's own variants: the schema has no parent context.
 - `WriteTable` rejects a crop before writing anything when it names an unknown or disabled
   variant or ratio, leaves the 0–1 range, or does not have the selected ratio's pixel
   proportion (0.5 % tolerance, skipped when the file has no extracted dimensions); the message

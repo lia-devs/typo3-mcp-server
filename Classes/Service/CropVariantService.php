@@ -8,6 +8,7 @@ use TYPO3\CMS\Core\Imaging\ImageManipulation\Area;
 use TYPO3\CMS\Core\Imaging\ImageManipulation\Ratio;
 use TYPO3\CMS\Core\Resource\FileInterface;
 use TYPO3\CMS\Core\Resource\FileType;
+use TYPO3\CMS\Core\Utility\GeneralUtility;
 
 /**
  * Crop variants of imageManipulation fields (e.g. sys_file_reference.crop) and
@@ -59,9 +60,10 @@ class CropVariantService
     /**
      * Crop variants that apply to the children of a file or inline field.
      *
-     * @param array $parentFieldConfig the parent field's `config`, with the parent
-     *        record type's columnsOverrides already applied (as a TcaSchema
-     *        sub-schema returns it)
+     * @param array $parentFieldConfig the parent field's `config` as it applies to the
+     *        parent record: the parent record type's columnsOverrides applied (as a
+     *        TcaSchema sub-schema returns it), and for a parent that is an inline child
+     *        itself, what its own parents pass down (InlineFieldConfigService)
      * @return array<string, array<string, array>> imageManipulation field of the
      *         child table => variant id => variant configuration; empty when the
      *         child table has no imageManipulation field
@@ -73,25 +75,46 @@ class CropVariantService
         // Cropping only exists for images, so the image type's overrides are the
         // ones the crop editor works with.
         $imageType = (string)FileType::IMAGE->value;
-        $overrideChildTca = $parentFieldConfig['overrideChildTca'] ?? [];
+        $inlineFieldConfigService = GeneralUtility::makeInstance(InlineFieldConfigService::class);
 
         $result = [];
         foreach ($childColumns as $fieldName => $column) {
             if (($column['config']['type'] ?? '') !== 'imageManipulation') {
                 continue;
             }
-            // Same order as FormEngine: the parent's overrideChildTca is merged into
-            // the child TCA first (InlineOverrideChildTca), then the child record
-            // type's columnsOverrides are applied (TcaColumnsOverrides).
-            $config = array_replace_recursive(
-                $column['config'],
-                $overrideChildTca['columns'][$fieldName]['config'] ?? [],
-                $GLOBALS['TCA'][$childTable]['types'][$imageType]['columnsOverrides'][$fieldName]['config'] ?? [],
-                $overrideChildTca['types'][$imageType]['columnsOverrides'][$fieldName]['config'] ?? []
-            );
+            $config = $inlineFieldConfigService->applyParentOverrides($childTable, (string)$fieldName, $imageType, $parentFieldConfig);
             $result[$fieldName] = $this->normalizeVariants($config);
         }
         return $result;
+    }
+
+    /**
+     * Whether an inline parent may set the crop variants of files on records of this
+     * table: some inline field to the table, in its base configuration or in a record
+     * type's columnsOverrides, carries cropVariants in its overrideChildTca.
+     */
+    public function canComeFromInlineParent(string $table): bool
+    {
+        foreach ($GLOBALS['TCA'] ?? [] as $tableConfig) {
+            $fieldConfigs = array_column($tableConfig['columns'] ?? [], 'config');
+            foreach ($tableConfig['types'] ?? [] as $type) {
+                foreach ($type['columnsOverrides'] ?? [] as $fieldName => $override) {
+                    // An override usually leaves foreign_table to the base column.
+                    $fieldConfigs[] = array_replace_recursive(
+                        $tableConfig['columns'][$fieldName]['config'] ?? [],
+                        $override['config'] ?? []
+                    );
+                }
+            }
+            foreach ($fieldConfigs as $config) {
+                if (($config['foreign_table'] ?? '') === $table
+                    && $this->containsCropVariants($config['overrideChildTca'] ?? [])
+                ) {
+                    return true;
+                }
+            }
+        }
+        return false;
     }
 
     /**
@@ -263,6 +286,19 @@ class CropVariantService
             return 'exceeds the image: x + width and y + height must not be above 1 (relative 0-1, not pixels)';
         }
         return null;
+    }
+
+    /**
+     * Whether an overrideChildTca sets crop variants, on its own children or further down.
+     */
+    private function containsCropVariants(array $tca): bool
+    {
+        foreach ($tca as $key => $value) {
+            if ($key === 'cropVariants' || (is_array($value) && $this->containsCropVariants($value))) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**

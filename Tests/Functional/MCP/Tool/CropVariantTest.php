@@ -25,6 +25,20 @@ class CropVariantTest extends FunctionalTestCase
      */
     private const LANDSCAPE_AREA = ['x' => 0, 'y' => 0.0062, 'width' => 1, 'height' => 0.9876];
 
+    /**
+     * A 1:1 area on the fixture image: full height, 1261.1 px wide, centered.
+     */
+    private const SQUARE_AREA = ['x' => 0.1625, 'y' => 0, 'width' => 0.6751, 'height' => 1];
+
+    /**
+     * Crop of a teaser item image with the variants only the teaser element type sets
+     * (two overrideChildTca levels above the file reference).
+     */
+    private const TEASER_CROP = [
+        'teaser' => ['cropArea' => self::LANDSCAPE_AREA, 'selectedRatio' => '3:2'],
+        'tile' => ['cropArea' => self::SQUARE_AREA, 'selectedRatio' => '1:1'],
+    ];
+
     protected array $coreExtensionsToLoad = [
         'workspaces',
         'frontend',
@@ -33,6 +47,7 @@ class CropVariantTest extends FunctionalTestCase
     protected array $testExtensionsToLoad = [
         __DIR__ . '/../../Fixtures/Extensions/test_crop_variants',
         __DIR__ . '/../../Fixtures/Extensions/test_nested_files',
+        __DIR__ . '/../../Fixtures/Extensions/test_untracked_foreign_field',
         'mcp_server',
     ];
 
@@ -250,6 +265,102 @@ class CropVariantTest extends FunctionalTestCase
         );
     }
 
+    #[Test]
+    public function newIndependentChildUsesTheVariantsItsParentElementSets(): void
+    {
+        $itemUid = $this->createTeaserElementWithItem(['uid_local' => 1, 'crop' => self::TEASER_CROP]);
+
+        $this->assertSame(['teaser', 'tile'], array_keys($this->readItemImageReference($itemUid)['crop']));
+    }
+
+    #[Test]
+    public function linkedIndependentChildWrittenOnItsOwnUsesTheVariantsOfItsParentElement(): void
+    {
+        $itemUid = $this->createTeaserElementWithItem(['uid_local' => 1]);
+
+        $result = $this->writeTool()->execute([
+            'table' => 'tx_testuntrackedforeignfield_item',
+            'action' => 'update',
+            'uid' => $itemUid,
+            'data' => [
+                'image' => [['uid_local' => 1, 'crop' => self::TEASER_CROP]],
+            ],
+        ]);
+
+        $this->assertFalse($result->isError, json_encode($result->jsonSerialize()));
+        $this->assertSame(['teaser', 'tile'], array_keys($this->readItemImageReference($itemUid)['crop']));
+    }
+
+    #[Test]
+    public function directReferenceWriteOnALinkedChildUsesTheVariantsOfItsParentElement(): void
+    {
+        $itemUid = $this->createTeaserElementWithItem(['uid_local' => 1]);
+        $referenceUid = $this->readItemImageReference($itemUid)['uid'];
+
+        $result = $this->writeTool()->execute([
+            'table' => 'sys_file_reference',
+            'action' => 'update',
+            'uid' => $referenceUid,
+            'data' => [
+                'crop' => ['tile' => ['cropArea' => self::SQUARE_AREA, 'selectedRatio' => '1:1']],
+            ],
+        ]);
+
+        $this->assertFalse($result->isError, json_encode($result->jsonSerialize()));
+        $this->assertSame(
+            ['cropArea' => self::SQUARE_AREA, 'selectedRatio' => '1:1'],
+            array_intersect_key($this->readItemImageReference($itemUid)['crop']['tile'], ['cropArea' => 1, 'selectedRatio' => 1])
+        );
+    }
+
+    #[Test]
+    public function linkedChildOfAnElementWithoutOverridesKeepsTheDefaultVariants(): void
+    {
+        $result = $this->writeTool()->execute([
+            'table' => 'tt_content',
+            'action' => 'create',
+            'pid' => 1,
+            'data' => [
+                'CType' => 'textmedia',
+                'header' => 'Element without teaser variants',
+                'tx_testuntrackedforeignfield_items' => [
+                    ['title' => 'Item', 'image' => [['uid_local' => 1, 'crop' => self::TEASER_CROP]]],
+                ],
+            ],
+        ]);
+
+        $this->assertTrue($result->isError);
+        $this->assertStringContainsString(
+            'Invalid crop: image[0].crop: unknown crop variant "teaser", available: default; '
+            . 'image[0].crop: unknown crop variant "tile", available: default',
+            $result->content[0]->text
+        );
+        $this->assertStringNotContainsString('not linked', $result->content[0]->text);
+    }
+
+    #[Test]
+    public function unlinkedChildIsToldToLinkItsParentElementFirst(): void
+    {
+        $result = $this->writeTool()->execute([
+            'table' => 'tx_testuntrackedforeignfield_item',
+            'action' => 'create',
+            'pid' => 1,
+            'data' => [
+                'title' => 'Item without element',
+                'image' => [['uid_local' => 1, 'crop' => ['teaser' => self::TEASER_CROP['teaser']]]],
+            ],
+        ]);
+
+        $this->assertTrue($result->isError);
+        $this->assertSame(
+            'Validation error: Invalid crop: image[0].crop: unknown crop variant "teaser", available: default. '
+            . 'The crop variants of this record can depend on the element it belongs to, and it is not linked to '
+            . 'one yet. Create it through the inline field of its parent element, or link it there first (by uid), '
+            . 'then set the crop.',
+            $result->content[0]->text
+        );
+    }
+
     private function writeTool(): WriteTableTool
     {
         return GeneralUtility::makeInstance(WriteTableTool::class);
@@ -287,6 +398,51 @@ class CropVariantTest extends FunctionalTestCase
         ]);
         $this->assertFalse($result->isError, json_encode($result->jsonSerialize()));
         return json_decode($result->content[0]->text, true)['records'][0]['tx_testcropvariants_image'];
+    }
+
+    /**
+     * Create a teaser element with one item and return the item's uid.
+     */
+    private function createTeaserElementWithItem(array $imageReference): int
+    {
+        $result = $this->writeTool()->execute([
+            'table' => 'tt_content',
+            'action' => 'create',
+            'pid' => 1,
+            'data' => [
+                'CType' => 'testuntrackedforeignfield_teaser',
+                'header' => 'Teaser element',
+                'tx_testuntrackedforeignfield_items' => [
+                    ['title' => 'Item', 'image' => [$imageReference]],
+                ],
+            ],
+        ]);
+        $this->assertFalse($result->isError, json_encode($result->jsonSerialize()));
+        $contentUid = (int)json_decode($result->content[0]->text, true)['uid'];
+
+        $read = GeneralUtility::makeInstance(ReadTableTool::class)->execute([
+            'table' => 'tt_content',
+            'uid' => $contentUid,
+        ]);
+        $this->assertFalse($read->isError, json_encode($read->jsonSerialize()));
+        $itemUids = json_decode($read->content[0]->text, true)['records'][0]['tx_testuntrackedforeignfield_items'];
+        $this->assertCount(1, $itemUids);
+        return (int)$itemUids[0];
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
+    private function readItemImageReference(int $itemUid): array
+    {
+        $result = GeneralUtility::makeInstance(ReadTableTool::class)->execute([
+            'table' => 'tx_testuntrackedforeignfield_item',
+            'uid' => $itemUid,
+        ]);
+        $this->assertFalse($result->isError, json_encode($result->jsonSerialize()));
+        $references = json_decode($result->content[0]->text, true)['records'][0]['image'];
+        $this->assertCount(1, $references);
+        return $references[0];
     }
 
     private function schemaFor(string $type): string
