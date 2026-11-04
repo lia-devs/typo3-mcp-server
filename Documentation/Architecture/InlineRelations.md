@@ -92,17 +92,40 @@ $writeTool->execute([
 ]);
 ```
 
-### Method 2: Parent Record Update with UIDs (Implemented)
-For independent relations, pass array of UIDs when updating parent:
+### Method 2: Parent Record Write with UIDs or Record Data (Implemented)
+For independent relations, each item of the array is one of:
+
+- a UID: link that record,
+- `{"uid": N, ...}`: link that record and patch the fields given (through `updateRecord()`),
+- record data without a uid: create a new record and link it (through `createRecord()`, so it
+  is validated like any other write and may carry inline fields of its own, e.g. `assets`).
+
+On update the list replaces the linked records: records left out are unlinked, not deleted.
+
+The foreign field is often no TCA column of the child table: TYPO3 sets it through
+RelationHandler, never through the child's form, and DataHandler silently drops a field it has
+no column for. `writeIndependentForeignField()` therefore uses DataHandler only when the field
+is a column. Otherwise it writes the field directly on the row the workspace sees: the record
+itself if it was created in the workspace, else its workspace version, created first with the
+same `version/new` command a backend form save issues. Live stays untouched until publishing.
+
+Linking a live child to another parent changes its foreign field in the workspace version only.
+`WorkspaceRestriction` selects no plain versions, so ReadTable additionally looks up the
+versions whose foreign field points at the parent and adds their live rows before the workspace
+overlay (`fetchChildrenLinkedInWorkspaceOnly()`).
 
 ```php
-// Update news with content elements
+// Keep 456, patch 789, create a new content element
 $writeTool->execute([
     'table' => 'tx_news_domain_model_news',
     'action' => 'update',
     'uid' => 123,
     'data' => [
-        'content_elements' => [456, 789, 1011]  // Array of UIDs
+        'content_elements' => [
+            456,
+            ['uid' => 789, 'header' => 'Updated header'],
+            ['CType' => 'text', 'header' => 'New element'],
+        ]
     ]
 ]);
 ```
@@ -146,6 +169,11 @@ $writeTool->execute([
 - `sys_file` itself is read-only - files are managed through the filesystem, not direct DB edits
 - New files are created with the `UploadFile` tool (from a URL, a YouTube/Vimeo link, text content,
   or a pre-signed upload); the resulting `sys_file` uid is then referenced via `uid_local`
+- A file field of the written record also takes plain `sys_file` uids (`'media' => [3, 4]`),
+  short for `[['uid_local' => 3], ['uid_local' => 4]]`. In any other embedded relation of the
+  written record an integer is the uid of an existing child, short for `['uid' => N]`.
+  Relations nested inside an embedded child take objects only
+- A new file reference without `uid_local` is rejected instead of being written without a file
 - Crops (`crop`, TCA `type=imageManipulation`) are read and written as an object keyed by crop
   variant: `{"default": {"cropArea": {"x": 0, "y": 0.0062, "width": 1, "height": 0.9876},
   "selectedRatio": "landscape"}}`, coordinates relative (0–1) to the original image.
@@ -212,6 +240,12 @@ version rows remain.
 
 ### 5. Sorting and Positioning
 - Sorting is handled through `sorting` or `sorting_foreign` fields
+- The array order of an inline field is the children's order. Embedded children get
+  `foreign_sortby` 256, 512, …; independent children are numbered 1, 2, 3 … like
+  `RelationHandler::writeForeignField()` does on a backend form save, written on the row
+  the workspace sees (also when the sortby field is `ctrl.sortby` only, not a column).
+  `ReadTable` orders inline children by the workspace values after the overlay, so a
+  reorder shows before publishing.
 - Position management (before/after) not fully implemented for inline relations
 
 ## Best Practices

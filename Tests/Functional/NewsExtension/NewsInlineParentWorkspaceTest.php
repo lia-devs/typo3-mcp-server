@@ -225,6 +225,8 @@ class NewsInlineParentWorkspaceTest extends FunctionalTestCase
         $this->assertWorkspaceVersionExists('tx_news_domain_model_news', self::OTHER_NEWS_UID);
         $this->assertWorkspaceVersionExists('tx_news_domain_model_news', self::NEWS_UID);
         $this->assertSame([self::SIBLING_CONTENT_UID], array_map('intval', $this->readNews(self::NEWS_UID)['content_elements']));
+        // The live row still points at the old news, the workspace version at the new one.
+        $this->assertSame([self::CONTENT_UID], array_map('intval', $this->readNews(self::OTHER_NEWS_UID)['content_elements']));
     }
 
     public function testCreatingNewsWithContentElementOfAnotherNewsMarksThatNews(): void

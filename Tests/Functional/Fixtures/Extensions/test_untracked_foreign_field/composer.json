@@ -1,0 +1,11 @@
+{
+    "name": "hn/test-untracked-foreign-field",
+    "type": "typo3-cms-extension",
+    "description": "Fixture: independent inline children whose foreign field is no TCA column",
+    "license": "GPL-2.0-or-later",
+    "extra": {
+        "typo3/cms": {
+            "extension-key": "test_untracked_foreign_field"
+        }
+    }
+}

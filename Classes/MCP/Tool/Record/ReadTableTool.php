@@ -1051,7 +1051,14 @@ class ReadTableTool extends AbstractRecordTool
         $eventDispatcher->dispatch(new BeforeRecordReadEvent($table, $queryBuilder, 'select', BeforeRecordReadEvent::SOURCE_READ_INLINE));
 
         $records = $queryBuilder->executeQuery()->fetchAllAssociative();
-        $records = $this->applyWorkspaceOverlay($table, $records);
+        $linkedInWorkspaceOnly = $this->fetchChildrenLinkedInWorkspaceOnly($table, $foreignField, $parentUids, $foreignMatchFields, $records);
+        $records = $this->applyWorkspaceOverlay($table, [...$records, ...$linkedInWorkspaceOnly]);
+        // The query sorted by the live values. A workspace version may carry its own
+        // (children reordered through their parent), and the rows linked in the workspace
+        // only were not part of the query at all: order by the workspace values.
+        if ($foreignSortBy !== '') {
+            usort($records, static fn(array $a, array $b): int => [(int)($a[$foreignSortBy] ?? 0), (int)$a['uid']] <=> [(int)($b[$foreignSortBy] ?? 0), (int)$b['uid']]);
+        }
 
         // Embedded children get a curated default whitelist passed through the
         // standard requestedFields filter. The whitelist is computed per record
@@ -1081,6 +1088,65 @@ class ReadTableTool extends AbstractRecordTool
         }
 
         return $processedRecords;
+    }
+
+    /**
+     * Live rows of children that belong to one of the parents in the workspace only: their
+     * workspace version points at the parent, their live row does not. WorkspaceRestriction
+     * selects no plain versions, so the inline query never sees them.
+     *
+     * @param array<int, array<string, mixed>> $selectedRows rows the inline query already has
+     * @return array<int, array<string, mixed>>
+     */
+    protected function fetchChildrenLinkedInWorkspaceOnly(string $table, string $foreignField, array $parentUids, array $foreignMatchFields, array $selectedRows): array
+    {
+        $workspaceId = (int)($GLOBALS['BE_USER']->workspace ?? 0);
+        if ($workspaceId <= 0 || empty($GLOBALS['TCA'][$table]['ctrl']['versioningWS'])) {
+            return [];
+        }
+
+        $connectionPool = GeneralUtility::makeInstance(ConnectionPool::class);
+        $versionQuery = $connectionPool->getQueryBuilderForTable($table);
+        $versionQuery->getRestrictions()->removeAll()->add(GeneralUtility::makeInstance(DeletedRestriction::class));
+        $versionQuery
+            ->select('t3ver_oid')
+            ->from($table)
+            ->where(
+                $versionQuery->expr()->eq('t3ver_wsid', $versionQuery->createNamedParameter($workspaceId, ParameterType::INTEGER)),
+                $versionQuery->expr()->gt('t3ver_oid', 0),
+                // Plain versions only: delete placeholders are gone in the workspace, move
+                // pointers are selected by the inline query already.
+                $versionQuery->expr()->eq('t3ver_state', 0),
+                $versionQuery->expr()->in($foreignField, $versionQuery->createNamedParameter($parentUids, Connection::PARAM_INT_ARRAY))
+            );
+        foreach ($foreignMatchFields as $matchField => $matchValue) {
+            $versionQuery->andWhere($versionQuery->expr()->eq($matchField, $versionQuery->createNamedParameter($matchValue)));
+        }
+
+        $selectedUids = [];
+        foreach ($selectedRows as $row) {
+            $selectedUids[] = (int)$row['uid'];
+            $selectedUids[] = (int)($row['t3ver_oid'] ?? 0);
+        }
+        $missingUids = array_values(array_diff(
+            array_map('intval', $versionQuery->executeQuery()->fetchFirstColumn()),
+            $selectedUids
+        ));
+        if ($missingUids === []) {
+            return [];
+        }
+
+        $liveQuery = $connectionPool->getQueryBuilderForTable($table);
+        $liveQuery->getRestrictions()->removeAll()->add(GeneralUtility::makeInstance(DeletedRestriction::class));
+        $liveQuery
+            ->select('*')
+            ->from($table)
+            ->where($liveQuery->expr()->in('uid', $liveQuery->createNamedParameter($missingUids, Connection::PARAM_INT_ARRAY)));
+
+        $eventDispatcher = GeneralUtility::makeInstance(EventDispatcherInterface::class);
+        $eventDispatcher->dispatch(new BeforeRecordReadEvent($table, $liveQuery, 'select', BeforeRecordReadEvent::SOURCE_READ_INLINE));
+
+        return $liveQuery->executeQuery()->fetchAllAssociative();
     }
 
     /**

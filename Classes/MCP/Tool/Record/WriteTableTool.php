@@ -100,7 +100,10 @@ class WriteTableTool extends AbstractRecordTool
                             'on "update" setting "pid" moves the record to that page (combine with "position" to control where on the new page it lands; e.g. data: {"pid": 1} moves the record to page 1). ' .
                             ($hasMultipleLanguages ? 'Language fields (sys_language_uid) accept ISO codes like "de", "fr" instead of numeric IDs. ' .
                                 '"update" never changes the language of a record; to translate a record use "translate", which creates a linked translation. ' : '') .
-                            'Inline relations can be specified as arrays - UIDs for independent tables, record data for embedded tables. ' .
+                            'Inline relations are arrays. For independent tables (e.g. content_elements → tt_content) each item is a UID to link, ' .
+                            '{"uid": <existing>, ...} to link and patch it, or record data to create a new linked record — nested inline fields included. ' .
+                            'File fields (image, media, assets) take sys_file UIDs [3, 4] or objects [{"uid_local": 3, "title": "...", "alternative": "..."}]. ' .
+                            'For other embedded tables each item is record data, or the UID of an existing child. ' .
                             'For embedded tables (e.g. file references), the array fully replaces the existing list: ' .
                             'children present in the previous record but missing from the new array are deleted. ' .
                             'To keep an existing child include it as {"uid": <existing>, ...}; only the fields you set are patched. ' .
@@ -1591,7 +1594,8 @@ class WriteTableTool extends AbstractRecordTool
             ) {
                 continue;
             }
-            foreach ($relationData['value'] as $childUid) {
+            foreach ($relationData['value'] as $item) {
+                $childUid = is_array($item) ? ($item['uid'] ?? null) : $item;
                 if (is_numeric($childUid) && (int)$childUid > 0) {
                     array_push($parents, ...$this->inlineParentService->findParents($foreignTable, (int)$childUid));
                 }
@@ -1637,6 +1641,7 @@ class WriteTableTool extends AbstractRecordTool
 
             if ($isHiddenTable) {
                 // Process embedded inline relations (e.g., tx_news_domain_model_link)
+                $value = $this->normalizeEmbeddedItems($config, $value);
                 $order = $this->processEmbeddedInlineRelations($dataMap, $foreignTable, $foreignField, $parentUid, $pid, $value, $config, $liveUid, $parentTable);
                 $embeddedRelations[$fieldName] = [
                     'foreignTable' => $foreignTable,
@@ -1645,7 +1650,7 @@ class WriteTableTool extends AbstractRecordTool
                 ];
             } else {
                 // Process independent inline relations (e.g., tt_content)
-                $this->processIndependentInlineRelations($foreignTable, $foreignField, $parentUid, $value, $liveUid);
+                $this->processIndependentInlineRelations($foreignTable, $foreignField, $config['foreign_sortby'] ?? null, $parentUid, $pid, $value, $liveUid);
             }
         }
 
@@ -2052,13 +2057,37 @@ class WriteTableTool extends AbstractRecordTool
     }
     
     /**
-     * Process independent inline relations (UIDs only)
+     * An integer in an embedded relation of the written record names something that exists
+     * already: the file in a file field (sys_file uid), the child record anywhere else.
+     * Turned into the object form here, so the embedded handling only deals with record data.
+     * Relations nested deeper take objects only (see resolveNestedEmbeddedRelations()).
+     */
+    protected function normalizeEmbeddedItems(array $config, array $items): array
+    {
+        $isFileField = ($config['type'] ?? '') === 'file';
+        foreach ($items as $index => $item) {
+            if (is_numeric($item)) {
+                $items[$index] = $isFileField ? ['uid_local' => (int)$item] : ['uid' => (int)$item];
+            }
+        }
+        return $items;
+    }
+
+    /**
+     * Process independent inline relations (e.g. content_elements → tt_content).
+     *
+     * Each item is a UID to link, {"uid": N, ...} to link and patch that record, or record
+     * data for a new record. New and patched records go through createRecord() and
+     * updateRecord(), so they are validated like any other write and may carry inline
+     * fields of their own. The list order becomes the children's order (foreign_sortby).
      */
     protected function processIndependentInlineRelations(
         string $foreignTable,
         string $foreignField,
+        ?string $sortbyField,
         $parentUid,
-        array $uids,
+        int $pid,
+        array $items,
         ?int $liveUid = null
     ): void {
         // For updates, we need to handle existing relations
@@ -2066,28 +2095,176 @@ class WriteTableTool extends AbstractRecordTool
             // First, clear existing relations
             $this->clearExistingInlineRelations($foreignTable, $foreignField, $liveUid);
         }
-        
-        // Update foreign field on specified records
-        if (!empty($uids)) {
-            $dataHandler = GeneralUtility::makeInstance(DataHandler::class);
-            $dataHandler->BE_USER = $GLOBALS['BE_USER'];
-            
-            $updateMap = [];
-            foreach ($uids as $uid) {
-                if (is_numeric($uid) && $uid > 0) {
-                    $updateMap[$foreignTable][$uid] = [
-                        $foreignField => $liveUid ?? $parentUid
-                    ];
+
+        $uids = [];
+        foreach ($items as $index => $item) {
+            if (!is_array($item)) {
+                if (is_numeric($item) && $item > 0) {
+                    $uids[] = (int)$item;
+                }
+                continue;
+            }
+
+            // The relation is set below for every item alike
+            unset($item[$foreignField]);
+
+            // A nested write runs processInlineRelations() again, which starts a fresh
+            // collection; the parent's own pending foreign fields must survive it.
+            $pendingNestedForeignFields = $this->pendingNestedForeignFields;
+            if (isset($item['uid'])) {
+                $childUid = (int)$item['uid'];
+                unset($item['uid']);
+                if ($item !== []) {
+                    $this->requireChildWritten($this->updateRecord($foreignTable, $childUid, $item), $foreignTable, $index);
+                }
+                $uids[] = $childUid;
+            } else {
+                $uids[] = $this->requireChildWritten($this->createRecord($foreignTable, $pid, $item, 'bottom'), $foreignTable, $index);
+            }
+            $this->pendingNestedForeignFields = $pendingNestedForeignFields;
+        }
+
+        $this->writeIndependentForeignField(
+            $foreignTable,
+            $foreignField,
+            array_filter($uids, static fn(int $uid): bool => $uid > 0),
+            (int)($liveUid ?? $parentUid),
+            $sortbyField
+        );
+    }
+
+    /**
+     * Point independent inline children at a parent; 0 detaches them.
+     *
+     * With a sortby field the children are numbered 1, 2, 3 … in list order, as
+     * RelationHandler::writeForeignField() does when the backend saves the parent's form.
+     *
+     * Fields that are TCA columns of the child go through DataHandler like any other
+     * field. Often they are none: TYPO3 itself sets the foreign field (and the sortby
+     * field, when it is only ctrl.sortby) through RelationHandler, never through the
+     * child's form, and DataHandler silently drops a field it has no column for. Those
+     * are written directly on the row the workspace sees. A live child gets its workspace
+     * version first, with the command DataHandler issues when the backend saves a form,
+     * so live stays untouched until publishing.
+     *
+     * @param list<int> $childUids live uids of the children, in display order
+     * @param string|null $sortbyField the relation's foreign_sortby; null leaves the order alone
+     */
+    protected function writeIndependentForeignField(
+        string $foreignTable,
+        string $foreignField,
+        array $childUids,
+        int $parentUid,
+        ?string $sortbyField = null
+    ): void {
+        if ($childUids === []) {
+            return;
+        }
+
+        $columns = $GLOBALS['TCA'][$foreignTable]['columns'] ?? [];
+        $updateMap = [];
+        $directFields = [];
+        foreach (array_values($childUids) as $position => $childUid) {
+            $fields = [$foreignField => $parentUid];
+            if ($sortbyField !== null) {
+                $fields[$sortbyField] = $position + 1;
+            }
+            foreach ($fields as $field => $value) {
+                if (isset($columns[$field])) {
+                    $updateMap[$foreignTable][$childUid][$field] = $value;
+                } else {
+                    $directFields[$childUid][$field] = $value;
                 }
             }
-            
-            if (!empty($updateMap)) {
-                $dataHandler->start($updateMap, []);
-                $dataHandler->process_datamap();
-            }
+        }
+
+        if ($updateMap !== []) {
+            $dataHandler = GeneralUtility::makeInstance(DataHandler::class);
+            $dataHandler->BE_USER = $GLOBALS['BE_USER'];
+            $dataHandler->start($updateMap, []);
+            $dataHandler->process_datamap();
+        }
+        if ($directFields === []) {
+            return;
+        }
+
+        if (!$GLOBALS['BE_USER']->check('tables_modify', $foreignTable)) {
+            throw new ValidationException(["No permission to modify $foreignTable, the inline children cannot be linked."]);
+        }
+
+        $workspaceId = (int)($GLOBALS['BE_USER']->workspace ?? 0);
+        $versioned = $workspaceId !== 0 && BackendUtility::isTableWorkspaceEnabled($foreignTable);
+        $connection = GeneralUtility::makeInstance(ConnectionPool::class)->getConnectionForTable($foreignTable);
+        foreach ($directFields as $childUid => $fields) {
+            $rowUid = $versioned ? $this->getWorkspaceRowUid($foreignTable, $childUid, $workspaceId) : $childUid;
+            $connection->update($foreignTable, $fields, ['uid' => $rowUid]);
         }
     }
-    
+
+    /**
+     * The row of a record the workspace sees: the record itself if it was created in the
+     * workspace, else its workspace version, created first if there is none yet.
+     *
+     * Queried directly: BackendUtility caches workspace versions per request, so it would
+     * still name the live row right after the version has been created.
+     */
+    protected function getWorkspaceRowUid(string $table, int $liveUid, int $workspaceId): int
+    {
+        $row = BackendUtility::getRecord($table, $liveUid, 't3ver_wsid');
+        if (is_array($row) && (int)$row['t3ver_wsid'] === $workspaceId) {
+            return $liveUid;
+        }
+
+        $versionUid = $this->findWorkspaceVersionUid($table, $liveUid, $workspaceId);
+        if ($versionUid !== null) {
+            return $versionUid;
+        }
+
+        $dataHandler = GeneralUtility::makeInstance(DataHandler::class);
+        $dataHandler->BE_USER = $GLOBALS['BE_USER'];
+        $dataHandler->start([], [
+            $table => [
+                $liveUid => ['version' => ['action' => 'new', 'label' => 'Auto-created for WS #' . $workspaceId]],
+            ],
+        ]);
+        $dataHandler->process_cmdmap();
+        $versionUid = $this->findWorkspaceVersionUid($table, $liveUid, $workspaceId);
+        if ($versionUid === null) {
+            throw new ValidationException([
+                "Record $table:$liveUid cannot be versioned in the workspace: " . implode(', ', $dataHandler->errorLog),
+            ]);
+        }
+        return $versionUid;
+    }
+
+    protected function findWorkspaceVersionUid(string $table, int $liveUid, int $workspaceId): ?int
+    {
+        $queryBuilder = GeneralUtility::makeInstance(ConnectionPool::class)->getQueryBuilderForTable($table);
+        $queryBuilder->getRestrictions()->removeAll()->add(GeneralUtility::makeInstance(DeletedRestriction::class));
+        $versionUid = $queryBuilder
+            ->select('uid')
+            ->from($table)
+            ->where(
+                $queryBuilder->expr()->eq('t3ver_oid', $queryBuilder->createNamedParameter($liveUid, ParameterType::INTEGER)),
+                $queryBuilder->expr()->eq('t3ver_wsid', $queryBuilder->createNamedParameter($workspaceId, ParameterType::INTEGER))
+            )
+            ->executeQuery()
+            ->fetchOne();
+        return $versionUid === false ? null : (int)$versionUid;
+    }
+
+    /**
+     * The live uid a nested create or update reports; its error as a validation error.
+     */
+    protected function requireChildWritten(CallToolResult $result, string $table, int|string $index): int
+    {
+        $text = $result->content[0]->text ?? '';
+        if ($result->isError) {
+            throw new ValidationException(["Item $index of the inline relation to $table: $text"]);
+        }
+        return (int)(json_decode($text, true)['uid'] ?? 0);
+    }
+
     /**
      * Clear existing inline relations
      */
@@ -2103,31 +2280,20 @@ class WriteTableTool extends AbstractRecordTool
             ->add(GeneralUtility::makeInstance(WorkspaceRestriction::class, $GLOBALS['BE_USER']->workspace ?? 0));
         
         $existingRecords = $queryBuilder
-            ->select('uid')
+            ->select('uid', 't3ver_oid')
             ->from($foreignTable)
             ->where(
                 $queryBuilder->expr()->eq($foreignField, $queryBuilder->createNamedParameter($parentUid, ParameterType::INTEGER))
             )
             ->executeQuery()
             ->fetchAllAssociative();
-        
-        if (!empty($existingRecords)) {
-            // Use DataHandler to clear relations to respect workspaces
-            $dataHandler = GeneralUtility::makeInstance(DataHandler::class);
-            $dataHandler->BE_USER = $GLOBALS['BE_USER'];
-            
-            $updateMap = [];
-            foreach ($existingRecords as $record) {
-                $updateMap[$foreignTable][$record['uid']] = [
-                    $foreignField => 0
-                ];
-            }
-            
-            if (!empty($updateMap)) {
-                $dataHandler->start($updateMap, []);
-                $dataHandler->process_datamap();
-            }
-        }
+
+        // A workspace version stands for its live record.
+        $childUids = array_values(array_unique(array_map(
+            static fn(array $record): int => (int)$record['t3ver_oid'] > 0 ? (int)$record['t3ver_oid'] : (int)$record['uid'],
+            $existingRecords
+        )));
+        $this->writeIndependentForeignField($foreignTable, $foreignField, $childUids, 0);
     }
     
     /**
@@ -2228,6 +2394,10 @@ class WriteTableTool extends AbstractRecordTool
     
     /**
      * Validate inline relation data
+     *
+     * Every item is record data or a positive integer UID (see normalizeEmbeddedItems() and
+     * processIndependentInlineRelations() for what a UID means where). A new file reference
+     * has to name its file.
      */
     protected function validateInlineRelationData(array $fieldConfig, $value): ?string
     {
@@ -2235,35 +2405,29 @@ class WriteTableTool extends AbstractRecordTool
         if (!is_array($value)) {
             return 'Inline relation field must be an array of UIDs or record data';
         }
-        
+
         // Get foreign table
         $foreignTable = $fieldConfig['config']['foreign_table'] ?? '';
         if (empty($foreignTable)) {
             return 'Invalid inline relation configuration: missing foreign_table';
         }
-        
-        // Check if foreign table is treated as embedded inline child
-        $isHiddenTable = $this->tableAccessService->isEmbeddedChildTable($foreignTable);
 
-        // Validate each item
+        $isFileField = ($fieldConfig['config']['type'] ?? '') === 'file';
         foreach ($value as $index => $item) {
-            if ($isHiddenTable) {
-                // For hidden tables, expect record data arrays
-                if (!is_array($item)) {
-                    return 'Embedded inline relations must contain record data arrays';
-                }
-                // Basic validation - must have at least one field
+            if (is_array($item)) {
                 if (empty($item)) {
-                    return 'Embedded inline relation record at index ' . $index . ' is empty';
+                    return 'Inline relation record at index ' . $index . ' is empty';
                 }
-            } else {
-                // For independent tables, expect UIDs
-                if (!is_numeric($item) || $item <= 0) {
-                    return 'Independent inline relations must contain only positive integer UIDs';
+                if ($isFileField && !isset($item['uid']) && !isset($item['uid_local'])) {
+                    return 'File reference at index ' . $index . ' must name its file: pass the sys_file uid, or an object with uid_local';
                 }
+                continue;
+            }
+            if (!is_numeric($item) || $item <= 0) {
+                return 'Inline relation item at index ' . $index . ' must be a record data array or a positive integer UID';
             }
         }
-        
+
         return null;
     }
     
