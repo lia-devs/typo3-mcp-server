@@ -5,10 +5,15 @@ declare(strict_types=1);
 namespace Hn\McpServer\Tests\Functional\MCP\Tool\File;
 
 use Hn\McpServer\MCP\Tool\File\PreviewFileTool;
+use Hn\McpServer\Service\SiteInformationService;
 use Mcp\Types\ImageContent;
 use Mcp\Types\TextContent;
+use PHPUnit\Framework\Attributes\Test;
+use TYPO3\CMS\Core\Core\Environment;
+use TYPO3\CMS\Core\Http\NormalizedParams;
+use TYPO3\CMS\Core\Http\ServerRequest;
+use TYPO3\CMS\Core\Http\Uri;
 use TYPO3\CMS\Core\Localization\LanguageServiceFactory;
-use TYPO3\CMS\Core\Resource\ResourceFactory;
 use TYPO3\CMS\Core\Resource\StorageRepository;
 use TYPO3\CMS\Core\Utility\GeneralUtility;
 use TYPO3\TestingFramework\Core\Functional\FunctionalTestCase;
@@ -121,5 +126,36 @@ class PreviewFileToolTest extends FunctionalTestCase
 
         $this->assertFalse($result->isError, $result->content[0]->text ?? '');
         $this->assertStringContainsString('previews at 300x300 px', $result->content[0]->text);
+    }
+
+    #[Test]
+    public function previewUrlIsAbsoluteToTheRequestBeingAnswered(): void
+    {
+        // TYPO3 installed at https://example.com/subdir/: the middleware routes
+        // /subdir/mcp/preview, so the URL handed out must carry the prefix.
+        $serverParams = [
+            'HTTP_HOST' => 'example.com',
+            'HTTPS' => 'on',
+            'SCRIPT_NAME' => '/subdir/index.php',
+            'SCRIPT_FILENAME' => Environment::getPublicPath() . '/index.php',
+            'REQUEST_URI' => '/subdir/mcp',
+        ];
+        $request = new ServerRequest(new Uri('https://example.com/subdir/mcp'), 'POST', null, [], $serverParams);
+        $request = $request->withAttribute('normalizedParams', NormalizedParams::createFromRequest($request));
+
+        $siteInformation = GeneralUtility::makeInstance(SiteInformationService::class);
+        $siteInformation->setCurrentRequest($request);
+        try {
+            $result = GeneralUtility::makeInstance(PreviewFileTool::class)
+                ->execute(['uid' => $this->imageUids[0], 'inline' => false]);
+        } finally {
+            $siteInformation->setCurrentRequest(null);
+        }
+
+        $this->assertFalse($result->isError, $result->content[0]->text ?? '');
+        $this->assertStringStartsWith(
+            'Preview URL: https://example.com/subdir/mcp/preview?uid=' . $this->imageUids[0] . '&w=400&h=400' . "\n",
+            $result->content[1]->text
+        );
     }
 }

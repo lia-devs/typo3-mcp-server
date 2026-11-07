@@ -5,15 +5,12 @@ declare(strict_types=1);
 namespace Hn\McpServer\MCP\Tool\File;
 
 use Hn\McpServer\Event\FilePreviewEvent;
-use Hn\McpServer\Http\RequestUrlTrait;
 use Hn\McpServer\MCP\Tool\Record\AbstractRecordTool;
-use Hn\McpServer\MCP\Tool\RequestAwareToolInterface;
-use Hn\McpServer\Service\BaseUrlService;
+use Hn\McpServer\Service\SiteInformationService;
 use Mcp\Types\CallToolResult;
 use Mcp\Types\ImageContent;
 use Mcp\Types\TextContent;
 use Psr\EventDispatcher\EventDispatcherInterface;
-use Psr\Http\Message\ServerRequestInterface;
 use TYPO3\CMS\Core\Resource\File;
 use TYPO3\CMS\Core\Resource\ProcessedFile;
 use TYPO3\CMS\Core\Resource\ResourceFactory;
@@ -29,10 +26,8 @@ use TYPO3\CMS\Core\Utility\GeneralUtility;
  * Other file types (PDFs, Office docs, etc.) can be handled by PSR-14
  * event listeners via FilePreviewEvent.
  */
-class PreviewFileTool extends AbstractRecordTool implements RequestAwareToolInterface
+class PreviewFileTool extends AbstractRecordTool
 {
-    use RequestUrlTrait;
-
     private const DEFAULT_WIDTH = 400;
     private const DEFAULT_HEIGHT = 400;
     private const MAX_WIDTH = 1200;
@@ -53,14 +48,6 @@ class PreviewFileTool extends AbstractRecordTool implements RequestAwareToolInte
      * returning anything.
      */
     private const MAX_FILES = 20;
-
-    private ?ServerRequestInterface $request = null;
-    private ?BaseUrlService $baseUrlService = null;
-
-    public function setRequest(ServerRequestInterface $request): void
-    {
-        $this->request = $request;
-    }
 
     public function getSchema(): array
     {
@@ -295,28 +282,18 @@ class PreviewFileTool extends AbstractRecordTool implements RequestAwareToolInte
         ]);
     }
 
+    /**
+     * Absolute through the request being answered (the MCP endpoint hands it to
+     * SiteInformationService), falling back to the site base without one.
+     */
     private function buildPreviewUrl(int $fileUid, int $width, int $height): string
     {
-        $baseUrl = $this->resolveBaseUrl();
-
-        return $baseUrl . '/mcp/preview?' . http_build_query([
-            'uid' => $fileUid,
-            'w' => $width,
-            'h' => $height,
-        ]);
-    }
-
-    private function resolveBaseUrl(): string
-    {
-        if ($this->request !== null) {
-            return $this->getRequestBaseUrl($this->request);
-        }
-
-        if ($this->baseUrlService === null) {
-            $this->baseUrlService = GeneralUtility::makeInstance(BaseUrlService::class);
-        }
-
-        return $this->baseUrlService->getBaseUrlFromSiteConfiguration();
+        return (string)GeneralUtility::makeInstance(SiteInformationService::class)
+            ->makeAbsoluteUrl('/mcp/preview?' . http_build_query([
+                'uid' => $fileUid,
+                'w' => $width,
+                'h' => $height,
+            ]));
     }
 
     private function isPreviewableImage(string $mimeType): bool
