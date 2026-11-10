@@ -32,7 +32,7 @@ class WriteTableTool extends AbstractRecordTool
 {
     /**
      * Appended to crop errors on a record whose crop variants may be set by an inline
-     * parent element it is not linked to (yet), e.g. a new lia_ctypes teaser item.
+     * parent element it is not linked to (yet), e.g. a new teaser item of a content element.
      */
     protected const CROP_NEEDS_INLINE_PARENT_HINT = 'The crop variants of this record can depend on the element it '
         . 'belongs to, and it is not linked to one yet. Create it through the inline field of its parent element, '
@@ -1460,7 +1460,7 @@ class WriteTableTool extends AbstractRecordTool
         // Crop values are checked before anything is written, against the variants of
         // the field the file is attached to. The record type's field configuration is
         // used because columnsOverrides may change the variants per type. A record in an
-        // inline field (e.g. a lia_ctypes teaser item) gets its field configuration from
+        // inline field (e.g. a teaser item of a content element) gets its field configuration from
         // the parent element as well, through overrideChildTca up the inline chain.
         $cropErrors = [];
         $inlineParentFieldConfig = $table === 'sys_file_reference'

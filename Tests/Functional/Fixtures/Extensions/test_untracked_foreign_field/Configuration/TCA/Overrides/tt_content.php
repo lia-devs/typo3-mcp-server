@@ -17,8 +17,8 @@ $GLOBALS['TCA']['tt_content']['columns']['tx_testuntrackedforeignfield_items'] =
 $GLOBALS['TCA']['tt_content']['types']['textmedia']['showitem'] =
     ($GLOBALS['TCA']['tt_content']['types']['textmedia']['showitem'] ?? '') . ',tx_testuntrackedforeignfield_items';
 
-// A teaser type that sets the crop variants of the children's image the way
-// lia_ctypes' static content teaser does: two overrideChildTca levels deep, so the
+// A teaser type that sets the crop variants of the children's image the way content
+// element extensions with teaser items do: two overrideChildTca levels deep, so the
 // variants exist only for a child linked to an element of this type.
 $GLOBALS['TCA']['tt_content']['columns']['CType']['config']['items'][] = [
     'label' => 'Teaser with cropped images',

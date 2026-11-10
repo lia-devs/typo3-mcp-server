@@ -181,10 +181,10 @@ $writeTool->execute([
   parent field's `overrideChildTca` (where Content Blocks puts `cropVariants`) with the parent
   record type's `columnsOverrides` applied, falling back to the core default variant.
   `GetTableSchema` lists them on the parent's file field.
-- The variants may also be set further up the inline chain. lia_ctypes' static content teaser
-  sets them in `tt_content.types[<CType>].columnsOverrides.tx_liactypes_ctypes.config
+- The variants may also be set further up the inline chain. A teaser element whose items are
+  independent inline children sets them in `tt_content.types[<CType>].columnsOverrides.<items field>.config
   .overrideChildTca.columns.image.config.overrideChildTca.columns.crop`: the file field
-  belongs to an independent child (`tx_liactypes_domain_model_ctypes`), its variants to the
+  belongs to an independent child (the item record), its variants to the
   element that child is linked to. `InlineFieldConfigService` rebuilds that chain the way
   FormEngine hands it down (`InlineOverrideChildTca`, then `TcaColumnsOverrides`), level by
   level: while `WriteTable` writes children through the parent's inline field, from the

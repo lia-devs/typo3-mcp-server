@@ -13,9 +13,9 @@ use TYPO3\CMS\Core\Utility\GeneralUtility;
  * An inline parent field may change the TCA of its children through
  * `overrideChildTca`, and the parent record type may change that field through
  * `columnsOverrides`. FormEngine hands the result down level by level, so a setting
- * can live two or more levels above the field it affects. Example (lia_ctypes'
- * static content teaser): the crop variants of a teaser image are set in
- * tt_content.types[<CType>].columnsOverrides.tx_liactypes_ctypes.config
+ * can live two or more levels above the field it affects. Example (a teaser element
+ * whose items are independent inline children): the crop variants of a teaser image
+ * are set in tt_content.types[<CType>].columnsOverrides.<items field>.config
  * .overrideChildTca.columns.image.config.overrideChildTca.columns.crop.
  *
  * The MCP writes independent children (and file references) on their own, outside
