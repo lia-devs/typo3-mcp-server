@@ -1557,7 +1557,7 @@ class WriteTableTool extends AbstractRecordTool
                 ];
             } else {
                 // Process independent inline relations (e.g., tt_content)
-                $this->processIndependentInlineRelations($foreignTable, $foreignField, $parentUid, $value, $liveUid);
+                $this->processIndependentInlineRelations($foreignTable, $config, $parentTable, $parentUid, $value, $liveUid);
             }
         }
 
@@ -1587,7 +1587,7 @@ class WriteTableTool extends AbstractRecordTool
 
         // Existing children of this parent (live uids). Empty for the create path.
         $existingChildUids = $liveUid !== null
-            ? $this->fetchEmbeddedRelationChildUids($foreignTable, $foreignField, $liveUid, $foreignMatchFields, $foreignTableField, $parentTable)
+            ? $this->fetchInlineChildUids($foreignTable, $foreignField, $liveUid, $foreignMatchFields, $foreignTableField, $parentTable)
             : [];
 
         // Reject any uid that does not currently belong to this parent. Otherwise a caller
@@ -1854,7 +1854,7 @@ class WriteTableTool extends AbstractRecordTool
             // Children of a record that does not exist yet cannot be claimed by uid.
             $existingChildUids = [];
             if (is_numeric($recordKey) && !empty($config['foreign_field'])) {
-                $existingChildUids = $this->fetchEmbeddedRelationChildUids(
+                $existingChildUids = $this->fetchInlineChildUids(
                     $foreignTable,
                     $config['foreign_field'],
                     $this->getLiveUid($table, (int)$recordKey),
@@ -1964,93 +1964,167 @@ class WriteTableTool extends AbstractRecordTool
     }
     
     /**
-     * Process independent inline relations (UIDs only)
+     * Process independent inline relations (UIDs only).
+     *
+     * @param array $config TCA config of the parent's inline field
      */
     protected function processIndependentInlineRelations(
         string $foreignTable,
-        string $foreignField,
+        array $config,
+        string $parentTable,
         $parentUid,
         array $uids,
         ?int $liveUid = null
     ): void {
-        // For updates, we need to handle existing relations
+        // An update replaces the list: the current children are detached first.
         if ($liveUid !== null) {
-            // First, clear existing relations
-            $this->clearExistingInlineRelations($foreignTable, $foreignField, $liveUid);
+            $this->clearExistingInlineRelations($foreignTable, $config, $parentTable, $liveUid);
         }
-        
-        // Update foreign field on specified records
-        if (!empty($uids)) {
-            $dataHandler = GeneralUtility::makeInstance(DataHandler::class);
-            $dataHandler->BE_USER = $GLOBALS['BE_USER'];
-            
-            $updateMap = [];
-            foreach ($uids as $uid) {
-                if (is_numeric($uid) && $uid > 0) {
-                    $updateMap[$foreignTable][$uid] = [
-                        $foreignField => $liveUid ?? $parentUid
-                    ];
-                }
+
+        $childUids = [];
+        foreach ($uids as $uid) {
+            if (is_numeric($uid) && (int)$uid > 0) {
+                $childUids[] = (int)$uid;
             }
-            
-            if (!empty($updateMap)) {
-                $dataHandler->start($updateMap, []);
-                $dataHandler->process_datamap();
-            }
+        }
+        $this->writeIndependentForeignField($foreignTable, $config, $parentTable, $childUids, (int)($liveUid ?? $parentUid));
+    }
+
+    /**
+     * Point independent inline children at a parent; parent 0 detaches them.
+     *
+     * Writes what RelationHandler::writeForeignField() writes when the backend saves the
+     * parent's form: the parent pointer (foreign_field), the parent's table
+     * (foreign_table_field) and foreign_match_fields. Detaching clears the pointer and the
+     * table and leaves the rest.
+     *
+     * These fields belong to the parent's relation, not to the child's form, so they
+     * are written directly, as RelationHandler does - never through DataHandler. It
+     * would silently drop a field that is no TCA column of the child (often the case:
+     * TYPO3 only ever sets it through the relation) and an exclude field the editor
+     * lacks permission for, and the write would report success with every child
+     * detached. Permission to edit the parent's field is checked with the parent.
+     *
+     * They go on the row the workspace sees. A live child gets its workspace version
+     * first, with the command DataHandler issues when the backend saves a form, so live
+     * stays untouched until publishing.
+     *
+     * @param array $config TCA config of the parent's inline field
+     * @param list<int> $childUids live uids of the children
+     */
+    protected function writeIndependentForeignField(
+        string $foreignTable,
+        array $config,
+        string $parentTable,
+        array $childUids,
+        int $parentUid
+    ): void {
+        if ($childUids === []) {
+            return;
+        }
+        if (!$GLOBALS['BE_USER']->check('tables_modify', $foreignTable)) {
+            throw new ValidationException(["No permission to modify $foreignTable, the inline children cannot be linked."]);
+        }
+
+        $foreignTableField = (string)($config['foreign_table_field'] ?? '');
+        $relationFields = [(string)$config['foreign_field'] => $parentUid];
+        if ($foreignTableField !== '') {
+            $relationFields[$foreignTableField] = $parentUid > 0 ? $parentTable : '';
+        }
+        if ($parentUid > 0) {
+            $relationFields += $config['foreign_match_fields'] ?? [];
+        }
+
+        $workspaceId = (int)($GLOBALS['BE_USER']->workspace ?? 0);
+        $versioned = $workspaceId !== 0 && !empty($GLOBALS['TCA'][$foreignTable]['ctrl']['versioningWS']);
+        $connection = GeneralUtility::makeInstance(ConnectionPool::class)->getConnectionForTable($foreignTable);
+        foreach ($childUids as $childUid) {
+            $rowUid = $versioned ? $this->getWorkspaceRowUid($foreignTable, $childUid, $workspaceId) : $childUid;
+            $connection->update($foreignTable, $relationFields, ['uid' => $rowUid]);
         }
     }
-    
+
     /**
-     * Clear existing inline relations
+     * The row of a record the workspace sees: the record itself if it was created in the
+     * workspace, else its workspace version, created first if there is none yet.
+     *
+     * Queried directly: BackendUtility caches workspace versions per request, so it would
+     * still name the live row right after the version has been created.
      */
-    protected function clearExistingInlineRelations(string $foreignTable, string $foreignField, int $parentUid): void
+    protected function getWorkspaceRowUid(string $table, int $liveUid, int $workspaceId): int
     {
-        // Get all records that currently have this parent
-        $queryBuilder = GeneralUtility::makeInstance(ConnectionPool::class)
-            ->getQueryBuilderForTable($foreignTable);
-        
-        $queryBuilder->getRestrictions()
-            ->removeAll()
-            ->add(GeneralUtility::makeInstance(DeletedRestriction::class))
-            ->add(GeneralUtility::makeInstance(WorkspaceRestriction::class, $GLOBALS['BE_USER']->workspace ?? 0));
-        
-        $existingRecords = $queryBuilder
+        $row = BackendUtility::getRecord($table, $liveUid, 't3ver_wsid');
+        if (is_array($row) && (int)$row['t3ver_wsid'] === $workspaceId) {
+            return $liveUid;
+        }
+
+        $versionUid = $this->findWorkspaceVersionUid($table, $liveUid, $workspaceId);
+        if ($versionUid !== null) {
+            return $versionUid;
+        }
+
+        $dataHandler = GeneralUtility::makeInstance(DataHandler::class);
+        $dataHandler->BE_USER = $GLOBALS['BE_USER'];
+        $dataHandler->start([], [
+            $table => [
+                $liveUid => ['version' => ['action' => 'new', 'label' => 'Auto-created for WS #' . $workspaceId]],
+            ],
+        ]);
+        $dataHandler->process_cmdmap();
+        $versionUid = $this->findWorkspaceVersionUid($table, $liveUid, $workspaceId);
+        if ($versionUid === null) {
+            throw new ValidationException([
+                "Record $table:$liveUid cannot be versioned in the workspace: " . implode(', ', $dataHandler->errorLog),
+            ]);
+        }
+        return $versionUid;
+    }
+
+    protected function findWorkspaceVersionUid(string $table, int $liveUid, int $workspaceId): ?int
+    {
+        $queryBuilder = GeneralUtility::makeInstance(ConnectionPool::class)->getQueryBuilderForTable($table);
+        $queryBuilder->getRestrictions()->removeAll()->add(GeneralUtility::makeInstance(DeletedRestriction::class));
+        $versionUid = $queryBuilder
             ->select('uid')
-            ->from($foreignTable)
+            ->from($table)
             ->where(
-                $queryBuilder->expr()->eq($foreignField, $queryBuilder->createNamedParameter($parentUid, ParameterType::INTEGER))
+                $queryBuilder->expr()->eq('t3ver_oid', $queryBuilder->createNamedParameter($liveUid, ParameterType::INTEGER)),
+                $queryBuilder->expr()->eq('t3ver_wsid', $queryBuilder->createNamedParameter($workspaceId, ParameterType::INTEGER))
             )
             ->executeQuery()
-            ->fetchAllAssociative();
-        
-        if (!empty($existingRecords)) {
-            // Use DataHandler to clear relations to respect workspaces
-            $dataHandler = GeneralUtility::makeInstance(DataHandler::class);
-            $dataHandler->BE_USER = $GLOBALS['BE_USER'];
-            
-            $updateMap = [];
-            foreach ($existingRecords as $record) {
-                $updateMap[$foreignTable][$record['uid']] = [
-                    $foreignField => 0
-                ];
-            }
-            
-            if (!empty($updateMap)) {
-                $dataHandler->start($updateMap, []);
-                $dataHandler->process_datamap();
-            }
-        }
+            ->fetchOne();
+        return $versionUid === false ? null : (int)$versionUid;
     }
-    
+
     /**
-     * Fetch the live uids of embedded children currently attached to a parent.
+     * Detach the independent children currently attached to a parent, scoped like the
+     * relation itself: by foreign_match_fields and the parent's table, so a parent of
+     * another table with the same uid keeps its children.
+     *
+     * @param array $config TCA config of the parent's inline field
+     */
+    protected function clearExistingInlineRelations(string $foreignTable, array $config, string $parentTable, int $parentUid): void
+    {
+        $childUids = $this->fetchInlineChildUids(
+            $foreignTable,
+            (string)$config['foreign_field'],
+            $parentUid,
+            $config['foreign_match_fields'] ?? [],
+            $config['foreign_table_field'] ?? null,
+            $parentTable
+        );
+        $this->writeIndependentForeignField($foreignTable, $config, $parentTable, $childUids, 0);
+    }
+
+    /**
+     * Fetch the live uids of the inline children currently attached to a parent.
      *
      * Workspace overlays are folded onto their live uid (t3ver_oid) so the result
      * matches the uids visible to the MCP client.
      *
      * @return int[]
      */
-    protected function fetchEmbeddedRelationChildUids(
+    protected function fetchInlineChildUids(
         string $foreignTable,
         string $foreignField,
         int $parentUid,

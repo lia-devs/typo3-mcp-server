@@ -107,6 +107,30 @@ $writeTool->execute([
 ]);
 ```
 
+On update the list replaces the linked records: records left out are unlinked, not deleted.
+
+`writeIndependentForeignField()` writes what `RelationHandler::writeForeignField()` writes when
+the backend saves the parent's form: the parent pointer (`foreign_field`), the parent's table
+(`foreign_table_field`, for a child table shared by several parent tables) and
+`foreign_match_fields`. These fields belong to the parent's relation, not to the child's form, so
+they never go through DataHandler: it silently drops a field that is no TCA column of the child
+(often the case, TYPO3 only ever sets it through the relation) and an exclude field the editor
+lacks permission for, and the write would report success with every child detached (#137).
+Permission to edit the parent's field is checked with the parent.
+
+They are written on the row the workspace sees: the record itself if it was created in the
+workspace, else its workspace version, created first with the same `version/new` command a
+backend form save issues. Live stays untouched until publishing.
+
+Detaching the previous children and reading them are scoped like the relation, by
+`foreign_match_fields` and the parent's table: a page and a content element with the same uid
+neither list nor detach each other's children.
+
+Linking a live child to another parent changes its foreign field in the workspace version only.
+`WorkspaceRestriction` selects no plain versions, so ReadTable additionally looks up the
+versions whose foreign field points at the parent and adds their live rows before the workspace
+overlay (`fetchChildrenLinkedInWorkspaceOnly()`).
+
 ### Method 3: Embedded Record Creation (Partially Working)
 For dependent relations, pass record data when creating parent:
 

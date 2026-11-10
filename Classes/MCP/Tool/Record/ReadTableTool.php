@@ -790,7 +790,7 @@ class ReadTableTool extends AbstractRecordTool
 
             match ($fieldType) {
                 'select', 'category' => $this->includeSelectRelations($result['records'], $fieldName, $fieldConfig, $table),
-                'inline', 'file' => $this->includeInlineRelations($result['records'], $fieldName, $fieldConfig, $recordUids),
+                'inline', 'file' => $this->includeInlineRelations($result['records'], $fieldName, $fieldConfig, $recordUids, $table),
                 default => null,
             };
         }
@@ -916,7 +916,7 @@ class ReadTableTool extends AbstractRecordTool
     /**
      * Include inline field relations
      */
-    protected function includeInlineRelations(array &$records, string $fieldName, array $fieldConfig, array $recordUids): void
+    protected function includeInlineRelations(array &$records, string $fieldName, array $fieldConfig, array $recordUids, string $parentTable): void
     {
         if (empty($fieldConfig['config']['foreign_table'])) {
             return;
@@ -938,6 +938,12 @@ class ReadTableTool extends AbstractRecordTool
         // (e.g., sys_file_reference uses tablenames/fieldname to distinguish which field owns each reference)
         $foreignSortBy = $fieldConfig['config']['foreign_sortby'] ?? '';
         $foreignMatchFields = $fieldConfig['config']['foreign_match_fields'] ?? [];
+        // A child table shared by several parent tables names the parent's table in
+        // foreign_table_field; without it a page and a content element with the same uid
+        // would list each other's children.
+        if (!empty($fieldConfig['config']['foreign_table_field'])) {
+            $foreignMatchFields[$fieldConfig['config']['foreign_table_field']] = $parentTable;
+        }
         $relatedRecords = $this->getInlineRelatedRecords($foreignTable, $foreignField, $recordUids, $foreignSortBy, $foreignMatchFields, $isHiddenTable);
 
         // Allow listeners to enrich or redact inline children (e.g. attach file metadata)
@@ -988,6 +994,65 @@ class ReadTableTool extends AbstractRecordTool
                 }
             }
         }
+    }
+
+    /**
+     * Live rows of children that belong to one of the parents in the workspace only: their
+     * workspace version points at the parent, their live row does not. WorkspaceRestriction
+     * selects no plain versions, so the inline query never sees them.
+     *
+     * @param array<int, array<string, mixed>> $selectedRows rows the inline query already has
+     * @return array<int, array<string, mixed>>
+     */
+    protected function fetchChildrenLinkedInWorkspaceOnly(string $table, string $foreignField, array $parentUids, array $foreignMatchFields, array $selectedRows): array
+    {
+        $workspaceId = (int)($GLOBALS['BE_USER']->workspace ?? 0);
+        if ($workspaceId <= 0 || empty($GLOBALS['TCA'][$table]['ctrl']['versioningWS'])) {
+            return [];
+        }
+
+        $connectionPool = GeneralUtility::makeInstance(ConnectionPool::class);
+        $versionQuery = $connectionPool->getQueryBuilderForTable($table);
+        $versionQuery->getRestrictions()->removeAll()->add(GeneralUtility::makeInstance(DeletedRestriction::class));
+        $versionQuery
+            ->select('t3ver_oid')
+            ->from($table)
+            ->where(
+                $versionQuery->expr()->eq('t3ver_wsid', $versionQuery->createNamedParameter($workspaceId, ParameterType::INTEGER)),
+                $versionQuery->expr()->gt('t3ver_oid', 0),
+                // Plain versions only: delete placeholders are gone in the workspace, move
+                // pointers are selected by the inline query already.
+                $versionQuery->expr()->eq('t3ver_state', 0),
+                $versionQuery->expr()->in($foreignField, $versionQuery->createNamedParameter($parentUids, Connection::PARAM_INT_ARRAY))
+            );
+        foreach ($foreignMatchFields as $matchField => $matchValue) {
+            $versionQuery->andWhere($versionQuery->expr()->eq($matchField, $versionQuery->createNamedParameter($matchValue)));
+        }
+
+        $selectedUids = [];
+        foreach ($selectedRows as $row) {
+            $selectedUids[] = (int)$row['uid'];
+            $selectedUids[] = (int)($row['t3ver_oid'] ?? 0);
+        }
+        $missingUids = array_values(array_diff(
+            array_map('intval', $versionQuery->executeQuery()->fetchFirstColumn()),
+            $selectedUids
+        ));
+        if ($missingUids === []) {
+            return [];
+        }
+
+        $liveQuery = $connectionPool->getQueryBuilderForTable($table);
+        $liveQuery->getRestrictions()->removeAll()->add(GeneralUtility::makeInstance(DeletedRestriction::class));
+        $liveQuery
+            ->select('*')
+            ->from($table)
+            ->where($liveQuery->expr()->in('uid', $liveQuery->createNamedParameter($missingUids, Connection::PARAM_INT_ARRAY)));
+
+        $eventDispatcher = GeneralUtility::makeInstance(EventDispatcherInterface::class);
+        $eventDispatcher->dispatch(new BeforeRecordReadEvent($table, $liveQuery, 'select', BeforeRecordReadEvent::SOURCE_READ_INLINE));
+
+        return $liveQuery->executeQuery()->fetchAllAssociative();
     }
 
     /**
@@ -1051,7 +1116,13 @@ class ReadTableTool extends AbstractRecordTool
         $eventDispatcher->dispatch(new BeforeRecordReadEvent($table, $queryBuilder, 'select', BeforeRecordReadEvent::SOURCE_READ_INLINE));
 
         $records = $queryBuilder->executeQuery()->fetchAllAssociative();
-        $records = $this->applyWorkspaceOverlay($table, $records);
+        $linkedInWorkspaceOnly = $this->fetchChildrenLinkedInWorkspaceOnly($table, $foreignField, $parentUids, $foreignMatchFields, $records);
+        $records = $this->applyWorkspaceOverlay($table, [...$records, ...$linkedInWorkspaceOnly]);
+        // The rows linked in the workspace only were not part of the sorted query:
+        // order by the workspace values.
+        if ($foreignSortBy !== '' && $linkedInWorkspaceOnly !== []) {
+            usort($records, static fn(array $a, array $b): int => [(int)($a[$foreignSortBy] ?? 0), (int)$a['uid']] <=> [(int)($b[$foreignSortBy] ?? 0), (int)$b['uid']]);
+        }
 
         // Embedded children get a curated default whitelist passed through the
         // standard requestedFields filter. The whitelist is computed per record
