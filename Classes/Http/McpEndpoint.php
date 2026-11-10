@@ -14,6 +14,7 @@ use Mcp\Server\Transport\Http\FileSessionStore;
 use Mcp\Server\Transport\Http\HttpMessage;
 use Psr\Http\Message\ResponseInterface;
 use Psr\Http\Message\ServerRequestInterface;
+use TYPO3\CMS\Core\Configuration\ExtensionConfiguration;
 use TYPO3\CMS\Core\Context\Context;
 use TYPO3\CMS\Core\Context\UserAspect;
 use TYPO3\CMS\Core\Context\WorkspaceAspect;
@@ -29,6 +30,11 @@ class McpEndpoint
 {
     use CorsHeadersTrait;
     use RequestUrlTrait;
+
+    /**
+     * Fallback for the sessionTimeout extension setting, in seconds.
+     */
+    private const DEFAULT_SESSION_TIMEOUT = 14400;
 
     /**
      * Header and query parameter names whose values must never reach a log file.
@@ -96,6 +102,14 @@ class McpEndpoint
      */
     public function __invoke(ServerRequestInterface $request): ResponseInterface
     {
+        // Answer CORS preflights before authentication: browsers never send
+        // the Authorization header on an OPTIONS preflight, so requiring a
+        // token here would fail every browser-based client with a 401 before
+        // its first real request.
+        if ($request->getMethod() === 'OPTIONS') {
+            return $this->handlePreflightRequest($request);
+        }
+
         try {
             // Get services through DI container
             $container = GeneralUtility::getContainer();
@@ -141,8 +155,14 @@ class McpEndpoint
 
             $this->logDebug("MCP: Token validation successful for user: " . $tokenInfo['be_user_uid']);
 
-            // Set up TYPO3 backend context for the authenticated user
-            $this->setupBackendUserContext($tokenInfo['be_user_uid']);
+            // Set up TYPO3 backend context for the authenticated user. A valid
+            // token whose user is deleted, disabled or outside its validity
+            // period gets the same answer as an invalid token: the response
+            // must not tell whether the account behind it exists.
+            if (!$this->setupBackendUserContext($tokenInfo['be_user_uid'])) {
+                $this->logDebug('MCP: Backend user of a valid token is not available');
+                return $this->createUnauthorizedResponse('Invalid or expired token', $request);
+            }
 
             // Set current request context in SiteInformationService
             $siteInformationService = $container->get(SiteInformationService::class);
@@ -155,7 +175,7 @@ class McpEndpoint
 
             // Configure HTTP options
             $httpOptions = [
-                'session_timeout' => 1800, // 30 minutes
+                'session_timeout' => $this->getSessionTimeout(),
                 'max_queue_size' => 500,
                 'enable_sse' => false,
                 'shared_hosting' => false,
@@ -212,8 +232,10 @@ class McpEndpoint
         } catch (\Throwable $e) {
             // Deliberately not behind the debug switch: this catch-all is the only
             // place where an exception from the MCP layer becomes visible at all,
-            // and handing it to the client alone means it is gone the moment the
-            // client discards the 500.
+            // so it is always logged. The client only gets a generic message -
+            // exception messages can carry internals (user ids, SQL, paths) and
+            // the endpoint is publicly reachable. Same approach as the upload
+            // endpoint.
             error_log(sprintf(
                 'MCP: Unhandled %s at %s:%d - %s%s%s',
                 get_class($e),
@@ -227,7 +249,7 @@ class McpEndpoint
             $stream = new Stream('php://temp', 'rw');
             $stream->write(json_encode([
                 'error' => 'Internal Server Error',
-                'message' => $e->getMessage()
+                'message' => 'An unexpected error occurred, see the server error log for details.',
             ]));
             $stream->rewind();
 
@@ -239,6 +261,29 @@ class McpEndpoint
 
             return $this->addCorsHeaders($response, $request);
         }
+    }
+
+    /**
+     * How long an idle MCP session is kept alive on the server, in seconds.
+     *
+     * Only clients using the session-based lifecycle (protocol revisions
+     * before 2026-07-28) are affected: once their session expired, the next
+     * request is answered with 404 and they have to start over. How well a
+     * client recovers from that varies - mcp-remote, for example, does not
+     * re-initialize, so the tool call appears to hang. Session files are
+     * tiny, so keeping them around longer costs next to nothing.
+     */
+    private function getSessionTimeout(): int
+    {
+        try {
+            $timeout = (int)GeneralUtility::makeInstance(ExtensionConfiguration::class)
+                ->get('mcp_server', 'sessionTimeout');
+        } catch (\Exception) {
+            // Extension configuration not synchronized yet
+            $timeout = 0;
+        }
+
+        return $timeout > 0 ? $timeout : self::DEFAULT_SESSION_TIMEOUT;
     }
 
     /**
@@ -303,11 +348,18 @@ class McpEndpoint
 
     /**
      * Set up backend user context
+     *
+     * @return bool false when the user cannot be impersonated (deleted,
+     *              disabled or outside its validity period)
      */
-    private function setupBackendUserContext(int $userId): void
+    private function setupBackendUserContext(int $userId): bool
     {
         $userContext = GeneralUtility::makeInstance(BackendUserContextService::class);
-        $beUser = $userContext->impersonate($userId);
+        try {
+            $beUser = $userContext->impersonate($userId);
+        } catch (\InvalidArgumentException) {
+            return false;
+        }
 
         // Pick the workspace the MCP tools work in and keep the Context aspect
         // in sync with it.
@@ -322,6 +374,8 @@ class McpEndpoint
 
         // Log workspace selection for debugging
         $this->logDebug("MCP: User {$userId} switched to workspace {$workspaceId}");
+
+        return true;
     }
 
     /**
