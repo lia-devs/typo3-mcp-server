@@ -51,7 +51,7 @@ services:
   Hn\McpServer\Server\SiteInstructionsService:
     public: true
 
-  # Public for GeneralUtility::makeInstance() calls in OAuthManageCommand / PreviewFileTool
+  # Public for the GeneralUtility::makeInstance() call in OAuthManageCommand
   Hn\McpServer\Service\BaseUrlService:
     public: true
 
