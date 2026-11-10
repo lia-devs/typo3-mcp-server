@@ -1519,7 +1519,7 @@ class WriteTableTool extends AbstractRecordTool
     /**
      * Process inline relations for DataHandler.
      *
-     * @return array<string, array{foreignTable: string, foreignField: string, order: array<int, int|string>}>
+     * @return array<string, array{foreignTable: string, foreignField: string, foreignTableField: string, parentTable: string, order: array<int, int|string>}>
      *         Per-field ordering info for embedded relations only, keyed by field name.
      *         Each `order` entry is an existing child's live uid (int) or a new child's
      *         "NEW..." datamap key (string). Passed to finalizeEmbeddedInlineRelations()
@@ -1558,6 +1558,8 @@ class WriteTableTool extends AbstractRecordTool
                 $embeddedRelations[$fieldName] = [
                     'foreignTable' => $foreignTable,
                     'foreignField' => $foreignField,
+                    'foreignTableField' => (string)($config['foreign_table_field'] ?? ''),
+                    'parentTable' => $parentTable,
                     'order' => $order,
                 ];
             } else {
@@ -1756,18 +1758,20 @@ class WriteTableTool extends AbstractRecordTool
                 $newUids[] = $realUid;
             }
 
-            // Point newly created children back at their parent. RelationHandler's
-            // writeForeignField is for MM relations, not direct foreign fields.
+            // Point newly created children back at their parent - with the parent's table
+            // as well, when the child table is shared through foreign_table_field. The
+            // datamap carried that table too, but DataHandler drops a value for a field
+            // without a TCA column, and TYPO3 selects the children by it (#158).
             if (!empty($newUids)) {
                 $connection = GeneralUtility::makeInstance(ConnectionPool::class)
                     ->getConnectionForTable($foreignTable);
+                $relationFields = [$foreignField => $parentLiveUid];
+                if ($relation['foreignTableField'] !== '') {
+                    $relationFields[$relation['foreignTableField']] = $relation['parentTable'];
+                }
 
                 foreach ($newUids as $childUid) {
-                    $connection->update(
-                        $foreignTable,
-                        [$foreignField => $parentLiveUid],
-                        ['uid' => $childUid]
-                    );
+                    $connection->update($foreignTable, $relationFields, ['uid' => $childUid]);
                 }
             }
 
@@ -1951,12 +1955,14 @@ class WriteTableTool extends AbstractRecordTool
                 $keys[] = $key;
 
                 // DataHandler leaves the foreign field of a nested child at 0 here, the same
-                // way it does for the top level - both are written directly after the run.
+                // way it does for the top level - both are written directly after the run,
+                // the parent's table with them when the child table is shared.
                 if (!empty($config['foreign_field'])) {
                     $this->pendingNestedForeignFields[] = [
                         'table' => $foreignTable,
                         'key' => $key,
                         'foreignField' => $config['foreign_field'],
+                        'foreignTableField' => (string)($config['foreign_table_field'] ?? ''),
                         'parentTable' => $table,
                         'parentKey' => $recordKey,
                     ];
@@ -2955,14 +2961,14 @@ class WriteTableTool extends AbstractRecordTool
 
             // Point at the live uid the way the top level does, so workspace overlays resolve.
             $parentUid = $this->getLiveUid($link['parentTable'], $parentUid);
+            $relationFields = [$link['foreignField'] => $parentUid];
+            if ($link['foreignTableField'] !== '') {
+                $relationFields[$link['foreignTableField']] = $link['parentTable'];
+            }
 
             GeneralUtility::makeInstance(ConnectionPool::class)
                 ->getConnectionForTable($link['table'])
-                ->update(
-                    $link['table'],
-                    [$link['foreignField'] => $parentUid],
-                    ['uid' => $childUid]
-                );
+                ->update($link['table'], $relationFields, ['uid' => $childUid]);
         }
     }
 
