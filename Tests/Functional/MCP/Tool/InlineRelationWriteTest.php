@@ -1020,7 +1020,7 @@ class InlineRelationWriteTest extends FunctionalTestCase
      * Nested inline relations: news → content elements (embedded) → file references (embedded)
      *
      * Verifies that inline children of inline children are created recursively.
-     * This is the pattern that failed for lia_ctypes: tt_content → tx_liactypes_ctypes.
+     * The same shape as a content element whose inline items carry their own images.
      */
     public function testNestedInlineRelationsAreCreatedRecursively(): void
     {
