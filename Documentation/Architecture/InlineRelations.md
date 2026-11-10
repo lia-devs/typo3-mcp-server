@@ -102,12 +102,23 @@ For independent relations, each item of the array is one of:
 
 On update the list replaces the linked records: records left out are unlinked, not deleted.
 
-The foreign field is often no TCA column of the child table: TYPO3 sets it through
-RelationHandler, never through the child's form, and DataHandler silently drops a field it has
-no column for. `writeIndependentForeignField()` therefore uses DataHandler only when the field
-is a column. Otherwise it writes the field directly on the row the workspace sees: the record
-itself if it was created in the workspace, else its workspace version, created first with the
-same `version/new` command a backend form save issues. Live stays untouched until publishing.
+`writeIndependentForeignField()` writes what `RelationHandler::writeForeignField()` writes when
+the backend saves the parent's form: the parent pointer (`foreign_field`), the parent's table
+(`foreign_table_field`, for a child table shared by several parent tables),
+`foreign_match_fields`, and with `foreign_sortby` the position. These fields belong to the
+parent's relation, not to the child's form, so they never go through DataHandler: it silently
+drops a field that is no TCA column of the child (often the case, TYPO3 only ever sets it
+through the relation) and an exclude field the editor lacks permission for, and the write would
+report success with every child detached (#137). Permission to edit the parent's field is
+checked with the parent.
+
+They are written on the row the workspace sees: the record itself if it was created in the
+workspace, else its workspace version, created first with the same `version/new` command a
+backend form save issues. Live stays untouched until publishing.
+
+Detaching the previous children and reading them are scoped like the relation, by
+`foreign_match_fields` and the parent's table: a page and a content element with the same uid
+neither list nor detach each other's children.
 
 Linking a live child to another parent changes its foreign field in the workspace version only.
 `WorkspaceRestriction` selects no plain versions, so ReadTable additionally looks up the
@@ -157,7 +168,12 @@ $writeTool->execute([
   2. Direct database UPDATE sets the foreign field after creation
 - The foreign field (e.g., `parent` in `tx_news_domain_model_link`) is NOT defined in the child table's TCA columns by design
 - DataHandler only processes fields that are defined in TCA columns, so it ignores the foreign field
-- **Solution**: After DataHandler creates child records, we directly update the foreign field in the database
+- **Solution**: After DataHandler creates child records, we directly update the foreign field in the database,
+  together with `foreign_table_field` when the child table is shared - DataHandler drops that one as well
+  when it is no column (#158). Children of children are linked the same way.
+- The parent's inline or file field then holds the number of its children, as DataHandler writes it on a
+  form save (`writeInlineChildCounts()`, #136): the children are written after the parent, so the field
+  would keep its old value, and Extbase skips a property whose column is NULL.
 - **Working Example**: Creating news with embedded links now works correctly
 
 ### 2. File References (sys_file_reference)
