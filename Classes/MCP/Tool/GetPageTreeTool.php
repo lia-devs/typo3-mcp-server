@@ -14,12 +14,12 @@ use TYPO3\CMS\Core\Database\Query\Restriction\DeletedRestriction;
 use TYPO3\CMS\Core\Database\Query\Restriction\WorkspaceRestriction;
 use TYPO3\CMS\Core\Utility\GeneralUtility;
 use TYPO3\CMS\Core\Domain\Repository\PageRepository;
-use TYPO3\CMS\Core\Context\Context;
-use TYPO3\CMS\Core\Context\LanguageAspect;
 use Hn\McpServer\Service\SiteInformationService;
 use Hn\McpServer\Service\LanguageService;
+use Hn\McpServer\Service\RecordUrlService;
 use Hn\McpServer\Service\TableAccessService;
 use Hn\McpServer\MCP\Tool\Record\AbstractRecordTool;
+use Hn\McpServer\Database\Query\Restriction\WorkspaceDeletePlaceholderRestriction;
 
 /**
  * Tool for retrieving the TYPO3 page tree
@@ -28,6 +28,7 @@ class GetPageTreeTool extends AbstractRecordTool
 {
     protected SiteInformationService $siteInformationService;
     protected LanguageService $languageService;
+    protected RecordUrlService $recordUrlService;
 
     public function __construct(
         SiteInformationService $siteInformationService,
@@ -36,6 +37,7 @@ class GetPageTreeTool extends AbstractRecordTool
         parent::__construct();
         $this->siteInformationService = $siteInformationService;
         $this->languageService = $languageService;
+        $this->recordUrlService = GeneralUtility::makeInstance(RecordUrlService::class);
     }
 
     /**
@@ -44,7 +46,8 @@ class GetPageTreeTool extends AbstractRecordTool
     public function getSchema(): array
     {
         $schema = [
-            'description' => 'Get the TYPO3 page tree structure as a readable text tree.Essential for understanding page hierarchy before creating new pages, finding pages by their position, and verifying parent-child relationships.',
+            'description' => 'Get the TYPO3 page tree structure as a readable text tree.Essential for understanding page hierarchy before creating new pages, finding pages by their position, and verifying parent-child relationships. '
+                . 'Each page shows its URL' . ($this->recordUrlService->isPreviewLinkEnabled() ? '; pages with unpublished changes also show a temporary preview URL that displays them without login.' : '.'),
             'inputSchema' => [
                 'type' => 'object',
                 'properties' => [
@@ -66,7 +69,7 @@ class GetPageTreeTool extends AbstractRecordTool
         if (count($availableLanguages) > 1) {
             $schema['inputSchema']['properties']['language'] = [
                 'type' => 'string',
-                'description' => 'Language ISO code to show translated page titles (e.g., "de", "fr"). Shows translation status for each page.',
+                'description' => 'Language ISO code to show translated page titles (e.g., "de", "fr"). Translated pages are then listed under the uid of their translation record, which is the one to edit in that language.',
                 'enum' => $availableLanguages,
             ];
         }
@@ -98,11 +101,26 @@ class GetPageTreeTool extends AbstractRecordTool
             }
         }
 
+        // Language views list translated pages under their translation's uid; such a
+        // uid starts the tree at its default-language page, in the translation's language
+        if ($startPage > 0) {
+            $startRecord = BackendUtility::getRecordWSOL('pages', $startPage);
+            if ((int)($startRecord['sys_language_uid'] ?? 0) > 0 && (int)($startRecord['l10n_parent'] ?? 0) > 0) {
+                $startPage = (int)$startRecord['l10n_parent'];
+                $languageUid ??= (int)$startRecord['sys_language_uid'];
+            }
+        }
+
         // Get page tree with the specified parameters
         $pageTree = $this->getPageTree($startPage, $depth, $languageUid);
         
         // Collect all page UIDs from the tree
         $pageUids = $this->collectPageUids($pageTree);
+
+        // Resolve URLs for the whole tree at once, so detecting unpublished
+        // content changes costs one query instead of one per page
+        $pageUrls = $this->recordUrlService->getUrls('pages', $this->collectVersioningRows($pageTree), $languageUid ?? 0);
+        $pageTree = $this->assignPageUrls($pageTree, $pageUrls);
         
         // Get record counts for all pages
         $recordCounts = $this->getRecordCounts($pageUids);
@@ -119,7 +137,7 @@ class GetPageTreeTool extends AbstractRecordTool
         // Convert the page tree to a text-based tree with indentation
         $textTree = $this->renderTextTree($pageTree, 0, $languageUid, $recordCounts, $pluginHints);
 
-        $textTree = $this->getWorkspaceHint() . $textTree;
+        $textTree = $this->getWorkspaceHint() . $this->getLanguageHint($languageUid) . $textTree;
 
         return new CallToolResult([new TextContent($textTree)]);
     }
@@ -138,12 +156,16 @@ class GetPageTreeTool extends AbstractRecordTool
         // WorkspaceRestriction: shows live records + workspace-new + move-pointer pages,
         // but NOT workspace overlays (t3ver_oid>0, t3ver_state≠4) — prevents duplicate
         // pages appearing for live records that have pending workspace modifications.
+        // WorkspaceDeletePlaceholderRestriction drops live pages that are deleted or
+        // moved in the workspace; a moved page is represented by its move pointer,
+        // which carries the new pid and sorting.
         // workspaceOL() is applied below to each record to replace live data with
         // its workspace-modified version where applicable.
         $queryBuilder->getRestrictions()
             ->removeAll()
             ->add(GeneralUtility::makeInstance(DeletedRestriction::class))
-            ->add(GeneralUtility::makeInstance(WorkspaceRestriction::class, $currentWorkspace));
+            ->add(GeneralUtility::makeInstance(WorkspaceRestriction::class, $currentWorkspace))
+            ->add(GeneralUtility::makeInstance(WorkspaceDeletePlaceholderRestriction::class, $currentWorkspace));
 
         // Build the query
         $query = $queryBuilder->select('*')
@@ -170,22 +192,9 @@ class GetPageTreeTool extends AbstractRecordTool
         // Execute the query
         $pages = $query->executeQuery()->fetchAllAssociative();
 
-        // Set up context for language and visibility
-        $context = GeneralUtility::makeInstance(Context::class);
-
-        // Set up language aspect if needed
-        if ($languageUid !== null && $languageUid > 0) {
-            $languageAspect = new LanguageAspect(
-                $languageUid,
-                $languageUid,
-                LanguageAspect::OVERLAYS_MIXED,
-                [$languageUid]
-            );
-            $context->setAspect('language', $languageAspect);
-        }
-
-        // Create PageRepository with context
-        $pageRepository = GeneralUtility::makeInstance(PageRepository::class, $context);
+        $pageRepository = $languageUid !== null && $languageUid > 0
+            ? $this->createLanguageOverlayRepository($languageUid)
+            : null;
 
         // Process the result
         $pageTree = [];
@@ -200,9 +209,13 @@ class GetPageTreeTool extends AbstractRecordTool
                 }
             }
 
-            // After workspaceOL(): overlay records have uid swapped to the live record's uid
-            // (t3ver_oid). Workspace-new pages (t3ver_oid=0) keep their original uid.
-            // Either way, $page['uid'] is now the correct live-facing uid.
+            // After workspaceOL(): overlay records have uid swapped to the live record's uid.
+            // A move pointer selected directly (page moved here in the workspace) has no
+            // further version to overlay, so it still carries its own uid: map it back
+            // to the live uid via t3ver_oid. Workspace-new pages (t3ver_oid=0) keep theirs.
+            if ((int)($page['t3ver_oid'] ?? 0) > 0) {
+                $page['uid'] = (int)$page['t3ver_oid'];
+            }
             $displayUid = (int)$page['uid'];
 
             $pageData = [
@@ -213,19 +226,28 @@ class GetPageTreeTool extends AbstractRecordTool
                 'hidden' => (bool)$page['hidden'],
                 'doktype' => (int)$page['doktype'],
                 'subpageCount' => 0,
-                'url' => $this->siteInformationService->generatePageUrl($displayUid),
+                // Resolved in one batch for the whole tree, see assignPageUrls()
+                '_versioning' => [
+                    'uid' => $displayUid,
+                    'pid' => (int)$page['pid'],
+                    't3ver_oid' => (int)($page['t3ver_oid'] ?? 0),
+                    't3ver_wsid' => (int)($page['t3ver_wsid'] ?? 0),
+                    't3ver_state' => (int)($page['t3ver_state'] ?? 0),
+                ],
             ];
 
             // Get language overlay if language specified
-            if ($languageUid !== null && $languageUid > 0) {
+            if ($pageRepository !== null) {
                 $overlaidPage = $pageRepository->getPageOverlay($page, $languageUid);
+                $translationUid = $this->getOverlayTranslationUid($overlaidPage);
 
-                if ($overlaidPage !== $page) {
+                if ($translationUid !== null) {
                     // Apply overlay data
                     $pageData['title'] = $overlaidPage['title'] ?: $pageData['title'];
                     $pageData['nav_title'] = $overlaidPage['nav_title'] ?: $pageData['nav_title'];
                     $pageData['hidden'] = (bool)$overlaidPage['hidden'];
                     $pageData['_translated'] = true;
+                    $pageData['_translationUid'] = $translationUid;
                 } else {
                     $pageData['_translated'] = false;
                 }
@@ -259,7 +281,8 @@ class GetPageTreeTool extends AbstractRecordTool
         $queryBuilder->getRestrictions()
             ->removeAll()
             ->add(GeneralUtility::makeInstance(DeletedRestriction::class))
-            ->add(GeneralUtility::makeInstance(WorkspaceRestriction::class, $currentWorkspace));
+            ->add(GeneralUtility::makeInstance(WorkspaceRestriction::class, $currentWorkspace))
+            ->add(GeneralUtility::makeInstance(WorkspaceDeletePlaceholderRestriction::class, $currentWorkspace));
 
         $query = $queryBuilder->count('uid')
             ->from('pages')
@@ -271,6 +294,42 @@ class GetPageTreeTool extends AbstractRecordTool
         return (int)$query->executeQuery()->fetchOne();
     }
     
+
+    /**
+     * Collect the versioning rows of all pages in the tree, keyed by page uid
+     *
+     * @return array<int, array<string, int>>
+     */
+    protected function collectVersioningRows(array $pageTree): array
+    {
+        $rows = [];
+        foreach ($pageTree as $page) {
+            $rows[$page['uid']] = $page['_versioning'];
+            if (!empty($page['subpages'])) {
+                $rows += $this->collectVersioningRows($page['subpages']);
+            }
+        }
+        return $rows;
+    }
+
+    /**
+     * Put the resolved URLs into the tree
+     *
+     * @param array<int, array{frontend_url?: string, preview_url?: string}> $pageUrls Keyed by page uid
+     */
+    protected function assignPageUrls(array $pageTree, array $pageUrls): array
+    {
+        foreach ($pageTree as &$page) {
+            $page['url'] = $pageUrls[$page['uid']]['frontend_url'] ?? null;
+            $page['preview_url'] = $pageUrls[$page['uid']]['preview_url'] ?? null;
+            unset($page['_versioning']);
+            if (!empty($page['subpages'])) {
+                $page['subpages'] = $this->assignPageUrls($page['subpages'], $pageUrls);
+            }
+        }
+        unset($page);
+        return $pageTree;
+    }
 
     /**
      * Collect all page UIDs from the tree structure
@@ -423,6 +482,27 @@ class GetPageTreeTool extends AbstractRecordTool
     }
 
     /**
+     * Which language the tree shows and how to reach the others; empty on single-language sites
+     */
+    protected function getLanguageHint(?int $languageUid): string
+    {
+        $isoCodes = $this->languageService->getAvailableIsoCodes();
+        if (count($isoCodes) < 2) {
+            return '';
+        }
+        $defaultIsoCode = $this->languageService->getDefaultIsoCode() ?? 'default';
+        if ($languageUid === null || $languageUid === 0) {
+            $others = array_values(array_diff($isoCodes, [$defaultIsoCode]));
+            return '[LANGUAGE: ' . strtoupper($defaultIsoCode) . ' (default language). Translations: '
+                . strtoupper(implode(', ', $others)) . ' — pass "language" to list their page uids.]' . "\n\n";
+        }
+        $isoCode = strtoupper($this->languageService->getIsoCodeFromUid($languageUid) ?? (string)$languageUid);
+        return '[LANGUAGE: ' . $isoCode . '. Translated pages are listed under the uid of their ' . $isoCode
+            . ' translation record — edit that uid. Untranslated pages show the ' . strtoupper($defaultIsoCode)
+            . ' original; use WriteTable action "translate" to translate them.]' . "\n\n";
+    }
+
+    /**
      * Render the page tree as a text-based tree with indentation
      */
     protected function renderTextTree(array $pageTree, int $level = 0, ?int $languageUid = null, array $recordCounts = [], array $pluginHints = []): string
@@ -435,13 +515,18 @@ class GetPageTreeTool extends AbstractRecordTool
             $hiddenMark = $page['hidden'] ? ' [HIDDEN]' : '';
             $doktypeLabel = $this->getDoktypeLabel($page['doktype']);
             
-            // Start building the line: [uid] Title [Type]
-            $result .= $indent . '- [' . $page['uid'] . '] ' . $title . ' [' . $doktypeLabel . ']' . $hiddenMark;
-            
+            // Start building the line: [uid] Title [Type]. In a language view the
+            // translation record is the one to edit, so its uid is the primary one.
+            $result .= $indent . '- [' . ($page['_translationUid'] ?? $page['uid']) . '] ' . $title . ' [' . $doktypeLabel . ']' . $hiddenMark;
+
             // Add translation status if language specified
             if ($languageUid !== null && $languageUid > 0) {
-                if (isset($page['_translated'])) {
-                    $result .= $page['_translated'] ? ' [TRANSLATED]' : ' [NOT TRANSLATED]';
+                $isoCode = strtoupper($this->languageService->getIsoCodeFromUid($languageUid) ?? (string)$languageUid);
+                if (isset($page['_translationUid'])) {
+                    $result .= ' [' . $isoCode . ' translation of page ' . $page['uid'] . ']';
+                } else {
+                    $defaultIsoCode = strtoupper($this->languageService->getDefaultIsoCode() ?? 'default');
+                    $result .= ' [NOT TRANSLATED, ' . $defaultIsoCode . ' original]';
                 }
             }
 
@@ -455,6 +540,9 @@ class GetPageTreeTool extends AbstractRecordTool
             // Add URL if available
             if (!empty($page['url'])) {
                 $result .= ' - ' . $page['url'];
+            }
+            if (!empty($page['preview_url'])) {
+                $result .= ' (' . (empty($page['url']) ? 'not published yet, ' : '') . 'preview with unpublished changes: ' . $page['preview_url'] . ')';
             }
             
             // If the page has subpages but we've reached max depth, show the count
