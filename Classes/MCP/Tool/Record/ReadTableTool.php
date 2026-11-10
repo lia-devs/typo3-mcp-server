@@ -790,7 +790,7 @@ class ReadTableTool extends AbstractRecordTool
 
             match ($fieldType) {
                 'select', 'category' => $this->includeSelectRelations($result['records'], $fieldName, $fieldConfig, $table),
-                'inline', 'file' => $this->includeInlineRelations($result['records'], $fieldName, $fieldConfig, $recordUids),
+                'inline', 'file' => $this->includeInlineRelations($result['records'], $fieldName, $fieldConfig, $recordUids, $table),
                 default => null,
             };
         }
@@ -916,7 +916,7 @@ class ReadTableTool extends AbstractRecordTool
     /**
      * Include inline field relations
      */
-    protected function includeInlineRelations(array &$records, string $fieldName, array $fieldConfig, array $recordUids): void
+    protected function includeInlineRelations(array &$records, string $fieldName, array $fieldConfig, array $recordUids, string $parentTable): void
     {
         if (empty($fieldConfig['config']['foreign_table'])) {
             return;
@@ -938,7 +938,13 @@ class ReadTableTool extends AbstractRecordTool
         // (e.g., sys_file_reference uses tablenames/fieldname to distinguish which field owns each reference)
         $foreignSortBy = $fieldConfig['config']['foreign_sortby'] ?? '';
         $foreignMatchFields = $fieldConfig['config']['foreign_match_fields'] ?? [];
-        $relatedRecords = $this->getInlineRelatedRecords($foreignTable, $foreignField, $recordUids, $foreignSortBy, $foreignMatchFields, $isHiddenTable);
+        // A child table shared by several parent tables names the parent's table in
+        // foreign_table_field; without it a page and a content element with the same uid
+        // would list each other's children.
+        if (!empty($fieldConfig['config']['foreign_table_field'])) {
+            $foreignMatchFields[$fieldConfig['config']['foreign_table_field']] = $parentTable;
+        }
+        $relatedRecords =$this->getInlineRelatedRecords($foreignTable, $foreignField, $recordUids, $foreignSortBy, $foreignMatchFields, $isHiddenTable);
 
         // Allow listeners to enrich or redact inline children (e.g. attach file metadata)
         if (!empty($relatedRecords)) {
