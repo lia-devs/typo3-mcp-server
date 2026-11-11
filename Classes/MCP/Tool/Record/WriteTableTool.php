@@ -13,6 +13,7 @@ use Hn\McpServer\Service\CropVariantService;
 use Hn\McpServer\Service\InlineFieldConfigService;
 use Hn\McpServer\Service\InlineParentService;
 use Hn\McpServer\Service\LanguageService;
+use Hn\McpServer\Service\RecordUrlService;
 use Mcp\Types\CallToolResult;
 use Psr\EventDispatcher\EventDispatcherInterface;
 use TYPO3\CMS\Backend\Utility\BackendUtility;
@@ -85,11 +86,14 @@ class WriteTableTool extends AbstractRecordTool
         $languageHint = $hasMultipleLanguages
             ? ' Language fields (sys_language_uid) can be provided as ISO codes (e.g., "de", "fr") instead of numeric IDs.'
             : '';
+        $previewHint = GeneralUtility::makeInstance(RecordUrlService::class)->isPreviewLinkEnabled()
+            ? ' For records shown on the website, the result contains a preview_url: a temporary link that shows the unpublished change without login, offer it to the user to review the change.'
+            : '';
 
         return [
             'description' => 'Create, update, translate, or delete records in a TYPO3 workspace. ' .
                 'Changes are NOT published live — they land in a workspace and stay invisible to website visitors until a human editor publishes them in the TYPO3 backend. ' .
-                'This tool cannot publish; if the user wants the change live, tell them to publish the workspace in the TYPO3 backend (or ask an editor to), never claim the change is already live.' . $languageHint . ' ' .
+                'This tool cannot publish; if the user wants the change live, tell them to publish the workspace in the TYPO3 backend (or ask an editor to), never claim the change is already live.' . $previewHint . $languageHint . ' ' .
                 'Before creating or updating content, always use GetPage to understand the page structure, existing content, and writing style. ' .
                 'Check existing content elements with ReadTable to ensure new content fits the page\'s tone and doesn\'t duplicate existing elements. ' .
                 'For content creation, verify the appropriate colPos by examining existing content layout. ' .
@@ -520,9 +524,12 @@ class WriteTableTool extends AbstractRecordTool
         $liveParentUid = $this->getLiveUid($table, $parentUid);
         
         // Now process inline relations with the resolved parent UID
+        $childCounts = [];
         if (!empty($inlineRelations)) {
             $childDataMap = [];
-            $embeddedRelations = $this->processInlineRelations($childDataMap, $table, $parentUid, $pid, $inlineRelations);
+            $relations = $this->processInlineRelations($childDataMap, $table, $parentUid, $pid, $inlineRelations);
+            $childCounts = $relations['counts'];
+            $embeddedRelations = $relations['embedded'];
 
             if (!empty($childDataMap)) {
                 // Create a new DataHandler instance for child records
@@ -548,6 +555,7 @@ class WriteTableTool extends AbstractRecordTool
                     return $finalizeResult;
                 }
             }
+
         }
 
 
@@ -556,6 +564,7 @@ class WriteTableTool extends AbstractRecordTool
 
         // A new inline child (e.g. tt_content pointing at a news record) changes its parent.
         $this->inlineParentService->markModified($table, $liveUid, $previousInlineParents);
+        $this->writeInlineChildCounts($table, $liveUid, $childCounts);
 
         $eventDispatcher = GeneralUtility::makeInstance(EventDispatcherInterface::class);
         $eventDispatcher->dispatch(new AfterRecordWriteEvent($table, 'create', $liveUid, $data, $pid));
@@ -565,7 +574,7 @@ class WriteTableTool extends AbstractRecordTool
             'action' => 'create',
             'table' => $table,
             'uid' => $liveUid,
-        ]);
+        ] + $this->getRecordUrls($table, $liveUid));
     }
     
     /**
@@ -626,13 +635,16 @@ class WriteTableTool extends AbstractRecordTool
         }
         
         // Now process inline relations with the resolved parent UID
+        $childCounts = [];
         if (!empty($inlineRelations)) {
             // Get record's pid for creating new inline records
             $record = BackendUtility::getRecord($table, $workspaceUid, 'pid');
             $pid = $record['pid'] ?? 0;
             
             $childDataMap = [];
-            $embeddedRelations = $this->processInlineRelations($childDataMap, $table, $workspaceUid, $pid, $inlineRelations, $uid);
+            $relations = $this->processInlineRelations($childDataMap, $table, $workspaceUid, $pid, $inlineRelations, $uid);
+            $embeddedRelations = $relations['embedded'];
+            $childCounts = $relations['counts'];
 
             // A new DataHandler instance is needed even when $childDataMap ends up empty
             // (a pure reorder of already-existing children has nothing to patch), since
@@ -676,6 +688,7 @@ class WriteTableTool extends AbstractRecordTool
         // Like a backend form save: the record counts as modified even if only its inline
         // children changed, and so do the inline parents it belongs to.
         $this->inlineParentService->markModified($table, $uid, $previousInlineParents);
+        $this->writeInlineChildCounts($table, $uid, $childCounts);
 
         // Suppressed when called as the inner step of translateRecord(), which
         // dispatches a single 'translate' event for the whole operation instead.
@@ -684,12 +697,13 @@ class WriteTableTool extends AbstractRecordTool
             $eventDispatcher->dispatch(new AfterRecordWriteEvent($table, 'update', $uid, $data, null));
         }
 
-        // Return the result with the original live UID
+        // Return the result with the original live UID. The URLs are left to the
+        // caller when this is the inner step of translateRecord().
         return $this->createJsonResult([
             'action' => 'update',
             'table' => $table,
             'uid' => $uid, // Return the live UID that was passed in
-        ]);
+        ] + ($dispatchEvent ? $this->getRecordUrls($table, $uid) : []));
     }
     
     /**
@@ -1199,7 +1213,28 @@ class WriteTableTool extends AbstractRecordTool
             'sourceUid' => $uid,
             'translationUid' => $newTranslationUid ?: 'Translation created but UID not found',
             'targetLanguage' => $targetIsoCode,
-        ]);
+        ] + ($newTranslationUid ? $this->getRecordUrls($table, (int)$newTranslationUid) : []));
+    }
+
+    /**
+     * frontend_url / preview_url of a record that was just written, so the result
+     * of an edit can be shown right away. Empty for records without a frontend view.
+     *
+     * @return array{frontend_url?: string, preview_url?: string}
+     */
+    protected function getRecordUrls(string $table, int $uid): array
+    {
+        try {
+            $record = BackendUtility::getRecordWSOL($table, $uid);
+            if (!is_array($record)) {
+                return [];
+            }
+            return GeneralUtility::makeInstance(RecordUrlService::class)->getUrls($table, [$record])[0] ?? [];
+        } catch (\Throwable $e) {
+            // The write itself succeeded, a missing link must not turn it into an error
+            $this->logException($e, sprintf('resolving URLs of %s:%d', $table, $uid));
+            return [];
+        }
     }
 
     /**
@@ -1670,11 +1705,17 @@ class WriteTableTool extends AbstractRecordTool
     /**
      * Process inline relations for DataHandler.
      *
-     * @return array<string, array{foreignTable: string, foreignField: string, order: array<int, int|string>}>
-     *         Per-field ordering info for embedded relations only, keyed by field name.
-     *         Each `order` entry is an existing child's live uid (int) or a new child's
-     *         "NEW..." datamap key (string). Passed to finalizeEmbeddedInlineRelations()
-     *         once the child DataHandler run has resolved real uids for new children.
+     * @return array{
+     *     embedded: array<string, array{foreignTable: string, foreignField: string, foreignTableField: string, parentTable: string, order: array<int, int|string>}>,
+     *     counts: array<string, int>
+     * }
+     *         `embedded`: per-field ordering info for embedded relations only, keyed by
+     *         field name. Each `order` entry is an existing child's live uid (int) or a
+     *         new child's "NEW..." datamap key (string). Passed to
+     *         finalizeEmbeddedInlineRelations() once the child DataHandler run has
+     *         resolved real uids for new children.
+     *         `counts`: the number of children each written field ends up with, for
+     *         writeInlineChildCounts() - the list replaces the field's children.
      */
     protected function processInlineRelations(
         array &$dataMap,
@@ -1688,6 +1729,7 @@ class WriteTableTool extends AbstractRecordTool
         // flushed must not leak entries into this one.
         $this->pendingNestedForeignFields = [];
         $embeddedRelations = [];
+        $childCounts = [];
 
         foreach ($inlineRelations as $fieldName => $relationData) {
             $config = $relationData['config'];
@@ -1709,8 +1751,11 @@ class WriteTableTool extends AbstractRecordTool
                 $embeddedRelations[$fieldName] = [
                     'foreignTable' => $foreignTable,
                     'foreignField' => $foreignField,
+                    'foreignTableField' => (string)($config['foreign_table_field'] ?? ''),
+                    'parentTable' => $parentTable,
                     'order' => $order,
                 ];
+                $childCounts[$fieldName] = count($order);
             } else {
                 // Process independent inline relations (e.g., tt_content)
                 $parentRow = BackendUtility::getRecordWSOL($parentTable, (int)($liveUid ?? $parentUid));
@@ -1721,11 +1766,11 @@ class WriteTableTool extends AbstractRecordTool
                     );
                 }
                 $parentFieldConfig = $this->inlineFieldConfigService->resolveFieldConfig($parentTable, $parentRow, (string)$fieldName);
-                $this->processIndependentInlineRelations($foreignTable, $foreignField, $config['foreign_sortby'] ?? null, $parentUid, $pid, $value, $parentFieldConfig, $liveUid);
+                $childCounts[$fieldName] = $this->processIndependentInlineRelations($foreignTable, $config, $parentTable, $parentUid, $pid, $value, $parentFieldConfig, $liveUid);
             }
         }
 
-        return $embeddedRelations;
+        return ['embedded' => $embeddedRelations, 'counts' => $childCounts];
     }
     
     /**
@@ -1751,7 +1796,7 @@ class WriteTableTool extends AbstractRecordTool
 
         // Existing children of this parent (live uids). Empty for the create path.
         $existingChildUids = $liveUid !== null
-            ? $this->fetchEmbeddedRelationChildUids($foreignTable, $foreignField, $liveUid, $foreignMatchFields, $foreignTableField, $parentTable)
+            ? $this->fetchInlineChildUids($foreignTable, $foreignField, $liveUid, $foreignMatchFields, $foreignTableField, $parentTable)
             : [];
 
         // Reject any uid that does not currently belong to this parent. Otherwise a caller
@@ -1915,18 +1960,20 @@ class WriteTableTool extends AbstractRecordTool
                 $newUids[] = $realUid;
             }
 
-            // Point newly created children back at their parent. RelationHandler's
-            // writeForeignField is for MM relations, not direct foreign fields.
+            // Point newly created children back at their parent - with the parent's table
+            // as well, when the child table is shared through foreign_table_field. The
+            // datamap carried that table too, but DataHandler drops a value for a field
+            // without a TCA column, and TYPO3 selects the children by it (#158).
             if (!empty($newUids)) {
                 $connection = GeneralUtility::makeInstance(ConnectionPool::class)
                     ->getConnectionForTable($foreignTable);
+                $relationFields = [$foreignField => $parentLiveUid];
+                if ($relation['foreignTableField'] !== '') {
+                    $relationFields[$relation['foreignTableField']] = $relation['parentTable'];
+                }
 
                 foreach ($newUids as $childUid) {
-                    $connection->update(
-                        $foreignTable,
-                        [$foreignField => $parentLiveUid],
-                        ['uid' => $childUid]
-                    );
+                    $connection->update($foreignTable, $relationFields, ['uid' => $childUid]);
                 }
             }
 
@@ -2018,7 +2065,7 @@ class WriteTableTool extends AbstractRecordTool
             // Children of a record that does not exist yet cannot be claimed by uid.
             $existingChildUids = [];
             if (is_numeric($recordKey) && !empty($config['foreign_field'])) {
-                $existingChildUids = $this->fetchEmbeddedRelationChildUids(
+                $existingChildUids = $this->fetchInlineChildUids(
                     $foreignTable,
                     $config['foreign_field'],
                     $this->getLiveUid($table, (int)$recordKey),
@@ -2110,12 +2157,14 @@ class WriteTableTool extends AbstractRecordTool
                 $keys[] = $key;
 
                 // DataHandler leaves the foreign field of a nested child at 0 here, the same
-                // way it does for the top level - both are written directly after the run.
+                // way it does for the top level - both are written directly after the run,
+                // the parent's table with them when the child table is shared.
                 if (!empty($config['foreign_field'])) {
                     $this->pendingNestedForeignFields[] = [
                         'table' => $foreignTable,
                         'key' => $key,
                         'foreignField' => $config['foreign_field'],
+                        'foreignTableField' => (string)($config['foreign_table_field'] ?? ''),
                         'parentTable' => $table,
                         'parentKey' => $recordKey,
                     ];
@@ -2151,25 +2200,29 @@ class WriteTableTool extends AbstractRecordTool
      * data for a new record. New and patched records go through createRecord() and
      * updateRecord(), so they are validated like any other write and may carry inline
      * fields of their own. The list order becomes the children's order (foreign_sortby).
+     *
      * They are validated with the parent field's configuration, whose overrideChildTca
      * may change their fields (e.g. crop variants).
      *
+     * @param array $config TCA config of the parent's inline field
      * @param array $parentFieldConfig the parent field's `config` as it applies to the parent record
+     * @return int the number of children the parent ends up with
      */
     protected function processIndependentInlineRelations(
         string $foreignTable,
-        string $foreignField,
-        ?string $sortbyField,
+        array $config,
+        string $parentTable,
         $parentUid,
         int $pid,
         array $items,
         array $parentFieldConfig,
         ?int $liveUid = null
-    ): void {
-        // For updates, we need to handle existing relations
+    ): int {
+        $foreignField = (string)$config['foreign_field'];
+
+        // An update replaces the list: the current children are detached first.
         if ($liveUid !== null) {
-            // First, clear existing relations
-            $this->clearExistingInlineRelations($foreignTable, $foreignField, $liveUid);
+            $this->clearExistingInlineRelations($foreignTable, $config, $parentTable, $liveUid);
         }
 
         $uids = [];
@@ -2208,81 +2261,107 @@ class WriteTableTool extends AbstractRecordTool
             $this->pendingNestedForeignFields = $pendingNestedForeignFields;
         }
 
-        $this->writeIndependentForeignField(
-            $foreignTable,
-            $foreignField,
-            array_filter($uids, static fn(int $uid): bool => $uid > 0),
-            (int)($liveUid ?? $parentUid),
-            $sortbyField
-        );
+        $childUids = array_values(array_filter($uids, static fn(int $uid): bool => $uid > 0));
+        $this->writeIndependentForeignField($foreignTable, $config, $parentTable, $childUids, (int)($liveUid ?? $parentUid));
+        return count($childUids);
     }
 
     /**
-     * Point independent inline children at a parent; 0 detaches them.
+     * Point independent inline children at a parent; parent 0 detaches them.
      *
-     * With a sortby field the children are numbered 1, 2, 3 … in list order, as
-     * RelationHandler::writeForeignField() does when the backend saves the parent's form.
+     * Writes what RelationHandler::writeForeignField() writes when the backend saves the
+     * parent's form: the parent pointer (foreign_field), the parent's table
+     * (foreign_table_field), foreign_match_fields, and with foreign_sortby the position
+     * 1, 2, 3 … in list order. Detaching clears the pointer and the table and leaves
+     * the rest.
      *
-     * Fields that are TCA columns of the child go through DataHandler like any other
-     * field. Often they are none: TYPO3 itself sets the foreign field (and the sortby
-     * field, when it is only ctrl.sortby) through RelationHandler, never through the
-     * child's form, and DataHandler silently drops a field it has no column for. Those
-     * are written directly on the row the workspace sees. A live child gets its workspace
-     * version first, with the command DataHandler issues when the backend saves a form,
-     * so live stays untouched until publishing.
+     * These fields belong to the parent's relation, not to the child's form, so they
+     * are written directly, as RelationHandler does - never through DataHandler. It
+     * would silently drop a field that is no TCA column of the child (often the case:
+     * TYPO3 only ever sets it through the relation) and an exclude field the editor
+     * lacks permission for, and the write would report success with every child
+     * detached. Permission to edit the parent's field is checked with the parent.
      *
+     * They go on the row the workspace sees. A live child gets its workspace version
+     * first, with the command DataHandler issues when the backend saves a form, so live
+     * stays untouched until publishing.
+     *
+     * @param array $config TCA config of the parent's inline field
      * @param list<int> $childUids live uids of the children, in display order
-     * @param string|null $sortbyField the relation's foreign_sortby; null leaves the order alone
      */
     protected function writeIndependentForeignField(
         string $foreignTable,
-        string $foreignField,
+        array $config,
+        string $parentTable,
         array $childUids,
-        int $parentUid,
-        ?string $sortbyField = null
+        int $parentUid
     ): void {
         if ($childUids === []) {
             return;
         }
-
-        $columns = $GLOBALS['TCA'][$foreignTable]['columns'] ?? [];
-        $updateMap = [];
-        $directFields = [];
-        foreach (array_values($childUids) as $position => $childUid) {
-            $fields = [$foreignField => $parentUid];
-            if ($sortbyField !== null) {
-                $fields[$sortbyField] = $position + 1;
-            }
-            foreach ($fields as $field => $value) {
-                if (isset($columns[$field])) {
-                    $updateMap[$foreignTable][$childUid][$field] = $value;
-                } else {
-                    $directFields[$childUid][$field] = $value;
-                }
-            }
-        }
-
-        if ($updateMap !== []) {
-            $dataHandler = GeneralUtility::makeInstance(DataHandler::class);
-            $dataHandler->BE_USER = $GLOBALS['BE_USER'];
-            $dataHandler->start($updateMap, []);
-            $dataHandler->process_datamap();
-        }
-        if ($directFields === []) {
-            return;
-        }
-
         if (!$GLOBALS['BE_USER']->check('tables_modify', $foreignTable)) {
             throw new ValidationException(["No permission to modify $foreignTable, the inline children cannot be linked."]);
         }
 
+        $foreignTableField = (string)($config['foreign_table_field'] ?? '');
+        $sortbyField = (string)($config['foreign_sortby'] ?? '');
+        $relationFields = [(string)$config['foreign_field'] => $parentUid];
+        if ($foreignTableField !== '') {
+            $relationFields[$foreignTableField] = $parentUid > 0 ? $parentTable : '';
+        }
+        if ($parentUid > 0) {
+            $relationFields += $config['foreign_match_fields'] ?? [];
+        }
+
         $workspaceId = (int)($GLOBALS['BE_USER']->workspace ?? 0);
-        $versioned = $workspaceId !== 0 && BackendUtility::isTableWorkspaceEnabled($foreignTable);
+        $versioned = $workspaceId !== 0 && !empty($GLOBALS['TCA'][$foreignTable]['ctrl']['versioningWS']);
         $connection = GeneralUtility::makeInstance(ConnectionPool::class)->getConnectionForTable($foreignTable);
-        foreach ($directFields as $childUid => $fields) {
+        foreach (array_values($childUids) as $position => $childUid) {
+            $fields = $relationFields;
+            if ($sortbyField !== '' && $parentUid > 0) {
+                $fields[$sortbyField] = $position + 1;
+            }
             $rowUid = $versioned ? $this->getWorkspaceRowUid($foreignTable, $childUid, $workspaceId) : $childUid;
             $connection->update($foreignTable, $fields, ['uid' => $rowUid]);
         }
+    }
+
+    /**
+     * Store on the parent how many children each written inline or file field has, as
+     * DataHandler does when the backend saves the form (#136).
+     *
+     * The children are written after the parent here, so its field would keep the value
+     * it had before. TYPO3 itself does not read relations through the counter, but
+     * Extbase skips a property whose column is NULL, and a 0 marks the relation empty
+     * for code that checks it.
+     *
+     * Written directly on the row the workspace sees: through DataHandler the field
+     * would be taken for a list of children to process again. Called after
+     * InlineParentService::markModified(), which versions a live parent the way that
+     * keeps its children's live rows intact; versioning it here again would not. A live
+     * parent without a version (the editor may not edit it) keeps its live counter.
+     *
+     * @param array<string, int> $counts field name => number of children
+     */
+    protected function writeInlineChildCounts(string $table, int $liveUid, array $counts): void
+    {
+        if ($counts === []) {
+            return;
+        }
+        $rowUid = $liveUid;
+        $workspaceId = (int)($GLOBALS['BE_USER']->workspace ?? 0);
+        if ($workspaceId !== 0 && !empty($GLOBALS['TCA'][$table]['ctrl']['versioningWS'])) {
+            $row = BackendUtility::getRecord($table, $liveUid, 't3ver_wsid');
+            if (!is_array($row) || (int)$row['t3ver_wsid'] !== $workspaceId) {
+                $rowUid = $this->findWorkspaceVersionUid($table, $liveUid, $workspaceId);
+                if ($rowUid === null) {
+                    return;
+                }
+            }
+        }
+        GeneralUtility::makeInstance(ConnectionPool::class)
+            ->getConnectionForTable($table)
+            ->update($table, $counts, ['uid' => $rowUid]);
     }
 
     /**
@@ -2350,45 +2429,34 @@ class WriteTableTool extends AbstractRecordTool
     }
 
     /**
-     * Clear existing inline relations
+     * Detach the independent children currently attached to a parent, scoped like the
+     * relation itself: by foreign_match_fields and the parent's table, so a parent of
+     * another table with the same uid keeps its children.
+     *
+     * @param array $config TCA config of the parent's inline field
      */
-    protected function clearExistingInlineRelations(string $foreignTable, string $foreignField, int $parentUid): void
+    protected function clearExistingInlineRelations(string $foreignTable, array $config, string $parentTable, int $parentUid): void
     {
-        // Get all records that currently have this parent
-        $queryBuilder = GeneralUtility::makeInstance(ConnectionPool::class)
-            ->getQueryBuilderForTable($foreignTable);
-        
-        $queryBuilder->getRestrictions()
-            ->removeAll()
-            ->add(GeneralUtility::makeInstance(DeletedRestriction::class))
-            ->add(GeneralUtility::makeInstance(WorkspaceRestriction::class, $GLOBALS['BE_USER']->workspace ?? 0));
-        
-        $existingRecords = $queryBuilder
-            ->select('uid', 't3ver_oid')
-            ->from($foreignTable)
-            ->where(
-                $queryBuilder->expr()->eq($foreignField, $queryBuilder->createNamedParameter($parentUid, ParameterType::INTEGER))
-            )
-            ->executeQuery()
-            ->fetchAllAssociative();
-
-        // A workspace version stands for its live record.
-        $childUids = array_values(array_unique(array_map(
-            static fn(array $record): int => (int)$record['t3ver_oid'] > 0 ? (int)$record['t3ver_oid'] : (int)$record['uid'],
-            $existingRecords
-        )));
-        $this->writeIndependentForeignField($foreignTable, $foreignField, $childUids, 0);
+        $childUids = $this->fetchInlineChildUids(
+            $foreignTable,
+            (string)$config['foreign_field'],
+            $parentUid,
+            $config['foreign_match_fields'] ?? [],
+            $config['foreign_table_field'] ?? null,
+            $parentTable
+        );
+        $this->writeIndependentForeignField($foreignTable, $config, $parentTable, $childUids, 0);
     }
-    
+
     /**
-     * Fetch the live uids of embedded children currently attached to a parent.
+     * Fetch the live uids of the inline children currently attached to a parent.
      *
      * Workspace overlays are folded onto their live uid (t3ver_oid) so the result
      * matches the uids visible to the MCP client.
      *
      * @return int[]
      */
-    protected function fetchEmbeddedRelationChildUids(
+    protected function fetchInlineChildUids(
         string $foreignTable,
         string $foreignField,
         int $parentUid,
@@ -3155,14 +3223,14 @@ class WriteTableTool extends AbstractRecordTool
 
             // Point at the live uid the way the top level does, so workspace overlays resolve.
             $parentUid = $this->getLiveUid($link['parentTable'], $parentUid);
+            $relationFields = [$link['foreignField'] => $parentUid];
+            if ($link['foreignTableField'] !== '') {
+                $relationFields[$link['foreignTableField']] = $link['parentTable'];
+            }
 
             GeneralUtility::makeInstance(ConnectionPool::class)
                 ->getConnectionForTable($link['table'])
-                ->update(
-                    $link['table'],
-                    [$link['foreignField'] => $parentUid],
-                    ['uid' => $childUid]
-                );
+                ->update($link['table'], $relationFields, ['uid' => $childUid]);
         }
     }
 
