@@ -5,13 +5,8 @@ declare(strict_types=1);
 namespace Hn\McpServer\Service;
 
 use Psr\Http\Message\ServerRequestInterface;
-use TYPO3\CMS\Core\Authentication\BackendUserAuthentication;
 use TYPO3\CMS\Core\Context\Context;
 use TYPO3\CMS\Core\Context\FileProcessingAspect;
-use TYPO3\CMS\Core\Context\UserAspect;
-use TYPO3\CMS\Core\Context\WorkspaceAspect;
-use TYPO3\CMS\Core\Database\ConnectionPool;
-use TYPO3\CMS\Core\Localization\LanguageServiceFactory;
 use TYPO3\CMS\Core\Utility\GeneralUtility;
 
 /**
@@ -24,16 +19,16 @@ class McpAuthenticationService
 {
     private OAuthService $oauthService;
     private WorkspaceContextService $workspaceContextService;
-    private LanguageServiceFactory $languageServiceFactory;
+    private BackendUserContextService $backendUserContextService;
 
     public function __construct(
         OAuthService $oauthService,
         WorkspaceContextService $workspaceContextService,
-        LanguageServiceFactory $languageServiceFactory
+        BackendUserContextService $backendUserContextService
     ) {
         $this->oauthService = $oauthService;
         $this->workspaceContextService = $workspaceContextService;
-        $this->languageServiceFactory = $languageServiceFactory;
+        $this->backendUserContextService = $backendUserContextService;
     }
 
     /**
@@ -94,43 +89,28 @@ class McpAuthenticationService
 
     /**
      * Set up TYPO3 backend user context for authenticated user
+     *
+     * @throws McpAuthenticationException when the user behind the token is
+     *         deleted, disabled or outside its validity period. A token
+     *         outlives all of these, so it must stop working with them - with
+     *         the same answer as an invalid token, which does not tell whether
+     *         the account exists.
      */
     public function setupBackendUserContext(int $userId): void
     {
-        $beUser = GeneralUtility::makeInstance(BackendUserAuthentication::class);
-
-        $connection = GeneralUtility::makeInstance(ConnectionPool::class)
-            ->getConnectionForTable('be_users');
-
-        $queryBuilder = $connection->createQueryBuilder();
-        $userData = $queryBuilder
-            ->select('*')
-            ->from('be_users')
-            ->where($queryBuilder->expr()->eq('uid', $queryBuilder->createNamedParameter($userId)))
-            ->executeQuery()
-            ->fetchAssociative();
-
-        if ($userData) {
-            $beUser->user = $userData;
-            $GLOBALS['BE_USER'] = $beUser;
-
-            $beUser->fetchGroupData();
-
-            $GLOBALS['LANG'] = $this->languageServiceFactory->createFromUserPreferences($beUser);
-
-            $workspaceId = $this->workspaceContextService->switchToOptimalWorkspace($beUser);
-
-            $context = GeneralUtility::makeInstance(Context::class);
-            $context->setAspect('backend.user', new UserAspect($beUser));
-            $context->setAspect('workspace', new WorkspaceAspect($workspaceId));
-
-            // Disable deferred image processing — DeferredBackendImageProcessor requires a full
-            // backend session with CSRF tokens, which MCP endpoints don't have (Bearer token only).
-            // Setting deferProcessing=false routes image processing through LocalImageProcessor.
-            $context->setAspect('fileProcessing', new FileProcessingAspect(false));
+        try {
+            $beUser = $this->backendUserContextService->impersonate($userId);
+        } catch (\InvalidArgumentException) {
+            throw new McpAuthenticationException('Invalid or expired token');
         }
 
-        $tcaFactory = GeneralUtility::getContainer()->get(\TYPO3\CMS\Core\Configuration\Tca\TcaFactory::class);
-        $GLOBALS['TCA'] = $tcaFactory->get();
+        $workspaceId = $this->workspaceContextService->switchToOptimalWorkspace($beUser);
+        $this->backendUserContextService->updateWorkspaceAspect($workspaceId);
+
+        // Disable deferred image processing — DeferredBackendImageProcessor requires a full
+        // backend session with CSRF tokens, which MCP endpoints don't have (Bearer token only).
+        // Setting deferProcessing=false routes image processing through LocalImageProcessor.
+        GeneralUtility::makeInstance(Context::class)
+            ->setAspect('fileProcessing', new FileProcessingAspect(false));
     }
 }
