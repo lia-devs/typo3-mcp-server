@@ -69,6 +69,41 @@ class OAuthConsentScreenTest extends AbstractFunctionalTest
     }
 
     /**
+     * Anyone can register a client under any name, so "Client: Claude" proves nothing.
+     * Where the code is sent is the fact a look-alike client cannot hide.
+     */
+    public function testConsentScreenNamesWhereAccessIsHandedTo(): void
+    {
+        $body = (string)$this->showConsentForm()->getBody();
+
+        self::assertStringContainsString('Access is handed to:</strong> client.example', $body);
+    }
+
+    public function testConsentScreenNamesALoopbackDestinationAsLocal(): void
+    {
+        $this->client = $this->service->registerClient([
+            'client_name' => 'Native',
+            'redirect_uris' => ['http://127.0.0.1/callback'],
+        ]);
+
+        $body = (string)$this->showConsentForm('http://127.0.0.1:49152/callback')->getBody();
+
+        self::assertStringContainsString('an application on this computer (127.0.0.1)', $body);
+    }
+
+    /**
+     * RFC 6749 §10.13: a consent screen that can be embedded can be clicked unseen.
+     */
+    public function testConsentScreenRefusesToBeFramed(): void
+    {
+        $response = $this->showConsentForm();
+
+        self::assertSame('DENY', $response->getHeaderLine('X-Frame-Options'));
+        self::assertStringContainsString("frame-ancestors 'none'", $response->getHeaderLine('Content-Security-Policy'));
+        self::assertSame('no-store', $response->getHeaderLine('Cache-Control'));
+    }
+
+    /**
      * The button used to be `type="button"` with `onclick="window.close()"`, which browsers
      * refuse for a tab they did not open — so it did nothing at all.
      */
