@@ -944,7 +944,7 @@ class ReadTableTool extends AbstractRecordTool
         if (!empty($fieldConfig['config']['foreign_table_field'])) {
             $foreignMatchFields[$fieldConfig['config']['foreign_table_field']] = $parentTable;
         }
-        $relatedRecords =$this->getInlineRelatedRecords($foreignTable, $foreignField, $recordUids, $foreignSortBy, $foreignMatchFields, $isHiddenTable);
+        $relatedRecords = $this->getInlineRelatedRecords($foreignTable, $foreignField, $recordUids, $foreignSortBy, $foreignMatchFields, $isHiddenTable);
 
         // Allow listeners to enrich or redact inline children (e.g. attach file metadata)
         if (!empty($relatedRecords)) {
@@ -1059,11 +1059,29 @@ class ReadTableTool extends AbstractRecordTool
         $records = $queryBuilder->executeQuery()->fetchAllAssociative();
         $linkedInWorkspaceOnly = $this->fetchChildrenLinkedInWorkspaceOnly($table, $foreignField, $parentUids, $foreignMatchFields, $records);
         $records = $this->applyWorkspaceOverlay($table, [...$records, ...$linkedInWorkspaceOnly]);
+        // The query matched the live pointer; the row the workspace sees decides: a child
+        // whose workspace version points at another parent is no child here.
+        $parentUidList = array_map('intval', $parentUids);
+        $records = array_values(array_filter(
+            $records,
+            static function (array $record) use ($foreignField, $parentUidList, $foreignMatchFields): bool {
+                if (!in_array((int)($record[$foreignField] ?? 0), $parentUidList, true)) {
+                    return false;
+                }
+                foreach ($foreignMatchFields as $matchField => $matchValue) {
+                    if ((string)($record[$matchField] ?? '') !== (string)$matchValue) {
+                        return false;
+                    }
+                }
+                return true;
+            }
+        ));
         // The query sorted by the live values. A workspace version may carry its own
         // (children reordered through their parent), and the rows linked in the workspace
         // only were not part of the query at all: order by the workspace values.
-        if ($foreignSortBy !== '') {
-            usort($records, static fn(array $a, array $b): int => [(int)($a[$foreignSortBy] ?? 0), (int)$a['uid']] <=> [(int)($b[$foreignSortBy] ?? 0), (int)$b['uid']]);
+        $sortBy = $foreignSortBy !== '' ? $foreignSortBy : (string)($GLOBALS['TCA'][$table]['ctrl']['sortby'] ?? '');
+        if ($sortBy !== '') {
+            usort($records, static fn(array $a, array $b): int => [(int)($a[$sortBy] ?? 0), (int)$a['uid']] <=> [(int)($b[$sortBy] ?? 0), (int)$b['uid']]);
         }
 
         // Embedded children get a curated default whitelist passed through the

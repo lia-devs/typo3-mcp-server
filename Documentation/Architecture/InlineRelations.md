@@ -100,31 +100,6 @@ For independent relations, each item of the array is one of:
 - record data without a uid: create a new record and link it (through `createRecord()`, so it
   is validated like any other write and may carry inline fields of its own, e.g. `assets`).
 
-On update the list replaces the linked records: records left out are unlinked, not deleted.
-
-`writeIndependentForeignField()` writes what `RelationHandler::writeForeignField()` writes when
-the backend saves the parent's form: the parent pointer (`foreign_field`), the parent's table
-(`foreign_table_field`, for a child table shared by several parent tables),
-`foreign_match_fields`, and with `foreign_sortby` the position. These fields belong to the
-parent's relation, not to the child's form, so they never go through DataHandler: it silently
-drops a field that is no TCA column of the child (often the case, TYPO3 only ever sets it
-through the relation) and an exclude field the editor lacks permission for, and the write would
-report success with every child detached (#137). Permission to edit the parent's field is
-checked with the parent.
-
-They are written on the row the workspace sees: the record itself if it was created in the
-workspace, else its workspace version, created first with the same `version/new` command a
-backend form save issues. Live stays untouched until publishing.
-
-Detaching the previous children and reading them are scoped like the relation, by
-`foreign_match_fields` and the parent's table: a page and a content element with the same uid
-neither list nor detach each other's children.
-
-Linking a live child to another parent changes its foreign field in the workspace version only.
-`WorkspaceRestriction` selects no plain versions, so ReadTable additionally looks up the
-versions whose foreign field points at the parent and adds their live rows before the workspace
-overlay (`fetchChildrenLinkedInWorkspaceOnly()`).
-
 ```php
 // Keep 456, patch 789, create a new content element
 $writeTool->execute([
@@ -140,6 +115,62 @@ $writeTool->execute([
     ]
 ]);
 ```
+
+On update the list replaces the linked records. A record left out that is linked live is deleted
+(in a workspace: a delete placeholder), as when it is removed in the backend form: TYPO3 has no
+detached state for an independent child that survives publishing - publishing the parent points
+every child whose live row names it back at it, so a child only unlinked in the workspace would be
+linked again live. A record left out that was linked in the workspace only gets that link taken
+back and stays the record of its own it was before.
+The list order is the children's order, numbered like RelationHandler does (`foreign_sortby`, else
+the child table's `sortby`).
+
+`writeIndependentForeignField()` writes what `RelationHandler::writeForeignField()` writes when
+the backend saves the parent's form: the parent pointer (`foreign_field`), the parent's table
+(`foreign_table_field`, for a child table shared by several parent tables),
+`foreign_match_fields`, the position and the change time, and it updates the child's own
+`sys_refindex` rows. These fields belong to the parent's
+relation, not to the child's form, so they never go through DataHandler: it silently drops a field
+that is no TCA column of the child (often the case, TYPO3 only ever sets it through the relation)
+and an exclude field the editor lacks permission for, and the write would report success with
+every child detached (#137).
+
+Saving the parent's field through DataHandler instead is no alternative: `RelationHandler` writes
+the uids it is given, and for an existing live child those are live rows - in a workspace, linking
+or reordering would go live at once. The backend never links existing records to another parent,
+it creates children in the form, so the core path does not cover this case.
+
+The child is still a record the editor changes. Before the first row of a relation field is
+written, every child to link, unlink or delete is checked (for a page to delete: the permission to
+delete it), so a refused child leaves that field's relation as it was - DataHandler may still refuse
+a deletion the checks cannot see, such as a hook; the children are deleted first, so then nothing
+is linked: it must exist as a live record and must not be deleted in the workspace; on the row the
+workspace sees (a child moved in the workspace lies on its new page) it must lie in the editor's
+page tree, on a page where they may edit content and that is not locked for editing, and it must
+pass the record checks (edit lock, language: `checkRecordEditAccess()`, on TYPO3 13
+`recordEditAccessInternals()`). The child's exclude fields do not matter. A child table without
+workspace support is refused in a workspace: its rows are live rows. The check covers one relation
+field; with several in one write, an earlier field may already be written when a later one is
+refused.
+
+They are written on the row the workspace sees: the record itself if it was created in the
+workspace, else its workspace version, created first with the same `version/new` command a
+backend form save issues. Live stays untouched until publishing.
+
+Which children a parent has is decided on the row the workspace sees, by `foreign_match_fields`
+and the parent's table: a child linked in the workspace only counts (and is unlinked again by the
+next list without it), one whose workspace version points at another parent does not. A page and a
+content element with the same uid neither list nor delete each other's children. ReadTable adds
+the live rows of children linked in the workspace only (`fetchChildrenLinkedInWorkspaceOnly()`,
+as `WorkspaceRestriction` selects no plain versions), keeps after the workspace overlay only the
+children whose workspace row points at the parent, and orders them by their workspace values.
+
+**Publishing.** Linking or reordering an existing child changes the child's own workspace
+version. TYPO3's workspace dependencies follow `sys_refindex`, which lists a parent's children by
+their live pointer: a child linked in the workspace only is not among them, so publishing only the
+parent leaves its link in the workspace (children still linked live, and deleted ones, go along).
+The write result names the children it changed (`changed_inline_children`) so they can be
+published together with the parent.
 
 ### Method 3: Embedded Record Creation (Partially Working)
 For dependent relations, pass record data when creating parent:
