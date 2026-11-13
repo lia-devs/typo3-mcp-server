@@ -1555,8 +1555,10 @@ class WriteTableTool extends AbstractRecordTool
      *         new child's "NEW..." datamap key (string). Passed to
      *         finalizeEmbeddedInlineRelations() once the child DataHandler run has
      *         resolved real uids for new children.
-     *         `counts`: the number of children each written field ends up with, for
-     *         writeInlineChildCounts() - the list replaces the field's children.
+     *         `counts`: the number of children each written independent field ends up
+     *         with, for writeInlineChildCounts() - the list replaces the field's children.
+     *         Embedded fields are counted by syncInlineParentBookkeeping(), together
+     *         with their sys_refindex rows.
      */
     protected function processInlineRelations(
         array &$dataMap,
@@ -1596,7 +1598,6 @@ class WriteTableTool extends AbstractRecordTool
                     'parentTable' => $parentTable,
                     'order' => $order,
                 ];
-                $childCounts[$fieldName] = count($order);
             } else {
                 // Process independent inline relations (e.g., tt_content)
                 $childCounts[$fieldName] = $this->processIndependentInlineRelations($foreignTable, $config, $parentTable, $parentUid, $pid, $value, $liveUid);
@@ -2179,8 +2180,9 @@ class WriteTableTool extends AbstractRecordTool
     }
 
     /**
-     * Store on the parent how many children each written inline or file field has, as
-     * DataHandler does when the backend saves the form (#136).
+     * Store on the parent how many children each written independent inline field has,
+     * as DataHandler does when the backend saves the form (#136). Embedded inline and
+     * file fields get theirs from syncInlineParentBookkeeping().
      *
      * The children are written after the parent here, so its field would keep the value
      * it had before. TYPO3 itself does not read relations through the counter, but
