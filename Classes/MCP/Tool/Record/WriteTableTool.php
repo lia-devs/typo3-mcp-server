@@ -306,6 +306,15 @@ class WriteTableTool extends AbstractRecordTool
             return $this->createErrorResult('Operation vetoed: ' . ($beforeEvent->getVetoReason() ?? 'No reason given'));
         }
         $data = $beforeEvent->getData();
+        // The records written along with this one get their say as well, and
+        // before the first row is written: a veto further down must not
+        // leave half of the write behind
+        if (is_array($data) && in_array($action, ['create', 'update'], true)) {
+            $vetoReason = $this->dispatchBeforeWriteForIndependentChildren($table, $data, $action === 'update' ? $uid : null, $pid);
+            if ($vetoReason !== null) {
+                return $this->createErrorResult('Operation vetoed: ' . $vetoReason);
+            }
+        }
         // Listeners may have rerouted the target page by editing data.pid —
         // re-extract so the create path honours their change. (For update,
         // updateRecord pulls pid from data itself, so it's already covered.)
@@ -345,6 +354,100 @@ class WriteTableTool extends AbstractRecordTool
         }
     }
     
+    /**
+     * Dispatch BeforeRecordWriteEvent for the independent inline children a
+     * write carries in its data: records of their own (tt_content below a
+     * news record) that are created, updated or - because an update no longer
+     * lists them - deleted along with the parent, at any depth.
+     *
+     * A listener that vetoes writes to a table as a matter of policy would
+     * otherwise be asked for a direct write to that table only, not for the
+     * same write nested into a parent. Embedded children (hidden tables like
+     * sys_file_reference) are part of their parent and travel in its data.
+     *
+     * @param array<string, mixed> $data the parent's data; children take over what listeners change
+     * @param int|null $uid live uid of the parent when it is updated
+     * @param int|null $pid page new children are created on, as far as known
+     * @return string|null the reason of the first veto, null when nobody objects
+     */
+    protected function dispatchBeforeWriteForIndependentChildren(string $table, array &$data, ?int $uid, ?int $pid): ?string
+    {
+        $eventDispatcher = GeneralUtility::makeInstance(EventDispatcherInterface::class);
+
+        foreach ($data as $fieldName => &$items) {
+            $config = $this->tableAccessService->getFieldConfig($table, (string)$fieldName)['config'] ?? [];
+            $foreignTable = (string)($config['foreign_table'] ?? '');
+            if (!in_array($config['type'] ?? '', ['inline', 'file'], true)
+                || $foreignTable === ''
+                || empty($config['foreign_field'])
+                || !is_array($items)
+                || $this->tableAccessService->isEmbeddedChildTable($foreignTable)
+            ) {
+                continue;
+            }
+
+            $listedUids = [];
+            foreach ($items as &$item) {
+                if (!is_array($item)) {
+                    if (is_numeric($item) && $item > 0) {
+                        $listedUids[] = (int)$item;
+                    }
+                    continue;
+                }
+                $childUid = isset($item['uid']) && is_numeric($item['uid']) ? (int)$item['uid'] : null;
+                $childData = $item;
+                unset($childData['uid']);
+                if ($childUid !== null) {
+                    $listedUids[] = $childUid;
+                    if ($childData === []) {
+                        // Only linked, not written
+                        continue;
+                    }
+                }
+
+                $event = new BeforeRecordWriteEvent(
+                    $foreignTable,
+                    $childUid === null ? 'create' : 'update',
+                    $childData,
+                    $childUid,
+                    $childUid === null ? $pid : null
+                );
+                $eventDispatcher->dispatch($event);
+                if ($event->isVetoed()) {
+                    return $event->getVetoReason() ?? 'No reason given';
+                }
+                $childData = $event->getData();
+
+                $vetoReason = $this->dispatchBeforeWriteForIndependentChildren($foreignTable, $childData, $childUid, $pid);
+                if ($vetoReason !== null) {
+                    return $vetoReason;
+                }
+                $item = $childUid === null ? $childData : ['uid' => $childUid] + $childData;
+            }
+            unset($item);
+
+            if ($uid === null) {
+                continue;
+            }
+            // The list replaces the field's children: what it no longer names
+            // and is linked live gets deleted (processIndependentInlineRelations())
+            $relation = $this->getIndependentRelationFields($config, $table, $uid);
+            foreach (array_diff($this->fetchIndependentChildUids($foreignTable, $config, $table, $uid), $listedUids) as $removedUid) {
+                if (!$this->rowMatchesRelation(BackendUtility::getRecord($foreignTable, $removedUid) ?? [], $relation)) {
+                    continue;
+                }
+                $event = new BeforeRecordWriteEvent($foreignTable, 'delete', [], (int)$removedUid, null);
+                $eventDispatcher->dispatch($event);
+                if ($event->isVetoed()) {
+                    return $event->getVetoReason() ?? 'No reason given';
+                }
+            }
+        }
+        unset($items);
+
+        return null;
+    }
+
     /**
      * Create a new record
      */
