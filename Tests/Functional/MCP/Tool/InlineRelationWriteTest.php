@@ -495,34 +495,16 @@ class InlineRelationWriteTest extends FunctionalTestCase
                 "Content element {$allContentUids[$index]} should still be related to news");
         }
         
-        // Check content elements that should be removed
+        // Content elements left out of the list are deleted, as when they are removed
+        // in the backend form: an independent child has no detached state that survives
+        // publishing (publishing the news would link it again).
         foreach ([0, 2] as $index) {
             $result = $readTool->execute([
                 'table' => 'tt_content',
                 'uid' => $allContentUids[$index],
             ]);
             $response = json_decode($result->content[0]->text, true);
-            if (!isset($response['records'][0])) {
-                $this->fail("No record found for content element {$allContentUids[$index]}");
-            }
-            $content = $response['records'][0];
-            // Check if the foreign field is returned
-            if (!array_key_exists('tx_news_related_news', $content)) {
-                // Field might be filtered out, check directly in database
-                $queryBuilder = GeneralUtility::makeInstance(\TYPO3\CMS\Core\Database\ConnectionPool::class)
-                    ->getQueryBuilderForTable('tt_content');
-                $queryBuilder->getRestrictions()->removeAll();
-                $dbRecord = $queryBuilder->select('tx_news_related_news')
-                    ->from('tt_content')
-                    ->where($queryBuilder->expr()->eq('uid', $allContentUids[$index]))
-                    ->executeQuery()
-                    ->fetchAssociative();
-                $relatedNews = $dbRecord['tx_news_related_news'] ?? 0;
-            } else {
-                $relatedNews = $content['tx_news_related_news'];
-            }
-            $this->assertEquals(0, $relatedNews, 
-                "Content element {$allContentUids[$index]} should no longer be related to news");
+            $this->assertSame([], $response['records'] ?? [], "Content element {$allContentUids[$index]} should be deleted");
         }
     }
 

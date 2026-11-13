@@ -1118,10 +1118,27 @@ class ReadTableTool extends AbstractRecordTool
         $records = $queryBuilder->executeQuery()->fetchAllAssociative();
         $linkedInWorkspaceOnly = $this->fetchChildrenLinkedInWorkspaceOnly($table, $foreignField, $parentUids, $foreignMatchFields, $records);
         $records = $this->applyWorkspaceOverlay($table, [...$records, ...$linkedInWorkspaceOnly]);
-        // The rows linked in the workspace only were not part of the sorted query:
-        // order by the workspace values.
-        if ($foreignSortBy !== '' && $linkedInWorkspaceOnly !== []) {
-            usort($records, static fn(array $a, array $b): int => [(int)($a[$foreignSortBy] ?? 0), (int)$a['uid']] <=> [(int)($b[$foreignSortBy] ?? 0), (int)$b['uid']]);
+        // The query matched the live pointer; the row the workspace sees decides: a child
+        // whose workspace version points at another parent is no child here.
+        $parentUidList = array_map('intval', $parentUids);
+        $records = array_values(array_filter(
+            $records,
+            static function (array $record) use ($foreignField, $parentUidList, $foreignMatchFields): bool {
+                if (!in_array((int)($record[$foreignField] ?? 0), $parentUidList, true)) {
+                    return false;
+                }
+                foreach ($foreignMatchFields as $matchField => $matchValue) {
+                    if ((string)($record[$matchField] ?? '') !== (string)$matchValue) {
+                        return false;
+                    }
+                }
+                return true;
+            }
+        ));
+        // The query sorted by live values: order by the ones the workspace sees.
+        $sortBy = $foreignSortBy !== '' ? $foreignSortBy : (string)($GLOBALS['TCA'][$table]['ctrl']['sortby'] ?? '');
+        if ($sortBy !== '') {
+            usort($records, static fn(array $a, array $b): int => [(int)($a[$sortBy] ?? 0), (int)$a['uid']] <=> [(int)($b[$sortBy] ?? 0), (int)$b['uid']]);
         }
 
         // Embedded children get a curated default whitelist passed through the
