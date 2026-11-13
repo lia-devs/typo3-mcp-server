@@ -174,6 +174,7 @@ $writeTool->execute([
 - The parent's inline or file field then holds the number of its children, as DataHandler writes it on a
   form save (`writeInlineChildCounts()`, #136): the children are written after the parent, so the field
   would keep its old value, and Extbase skips a property whose column is NULL.
+- Because the children are linked after the parent was written, DataHandler's own bookkeeping for the parent field is missing: the counter column stays 0 and `sys_refindex` has no rows for the relation. Both are synced after linking (`syncInlineParentBookkeeping()`), also for nested children, always on the workspace version of the parent and never on its live row. Without the `sys_refindex` rows the workspace dependency resolver does not see the children, so publishing the parent would leave them in the workspace
 - **Working Example**: Creating news with embedded links now works correctly
 
 ### 2. File References (sys_file_reference)

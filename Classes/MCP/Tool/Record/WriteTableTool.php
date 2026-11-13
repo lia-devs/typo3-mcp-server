@@ -20,6 +20,7 @@ use TYPO3\CMS\Core\DataHandling\DataHandler;
 use TYPO3\CMS\Core\Utility\GeneralUtility;
 use TYPO3\CMS\Core\Database\ConnectionPool;
 use TYPO3\CMS\Core\Database\Query\Restriction\DeletedRestriction;
+use TYPO3\CMS\Core\Database\ReferenceIndex;
 use TYPO3\CMS\Core\Database\Query\Restriction\WorkspaceRestriction;
 
 /**
@@ -498,6 +499,7 @@ class WriteTableTool extends AbstractRecordTool
         
         // Now process inline relations with the resolved parent UID
         $childCounts = [];
+        $embeddedRelations = [];
         if (!empty($inlineRelations)) {
             $childDataMap = [];
             $relations = $this->processInlineRelations($childDataMap, $table, $parentUid, $pid, $inlineRelations);
@@ -538,6 +540,13 @@ class WriteTableTool extends AbstractRecordTool
         // A new inline child (e.g. tt_content pointing at a news record) changes its parent.
         $this->inlineParentService->markModified($table, $liveUid, $previousInlineParents);
         $this->writeInlineChildCounts($table, $liveUid, $childCounts);
+
+        if ($embeddedRelations !== []) {
+            $this->syncInlineParentBookkeeping($table, $liveUid, array_map(
+                static fn(array $relation): int => count(array_unique($relation['order'])),
+                $embeddedRelations
+            ));
+        }
 
         $eventDispatcher = GeneralUtility::makeInstance(EventDispatcherInterface::class);
         $eventDispatcher->dispatch(new AfterRecordWriteEvent($table, 'create', $liveUid, $data, $pid));
@@ -609,6 +618,7 @@ class WriteTableTool extends AbstractRecordTool
         
         // Now process inline relations with the resolved parent UID
         $childCounts = [];
+        $embeddedRelations = [];
         if (!empty($inlineRelations)) {
             // Get record's pid for creating new inline records
             $record = BackendUtility::getRecord($table, $workspaceUid, 'pid');
@@ -662,6 +672,14 @@ class WriteTableTool extends AbstractRecordTool
         // children changed, and so do the inline parents it belongs to.
         $this->inlineParentService->markModified($table, $uid, $previousInlineParents);
         $this->writeInlineChildCounts($table, $uid, $childCounts);
+
+        // After markModified(), so the parent has its workspace version.
+        if ($embeddedRelations !== []) {
+            $this->syncInlineParentBookkeeping($table, $uid, array_map(
+                static fn(array $relation): int => count(array_unique($relation['order'])),
+                $embeddedRelations
+            ));
+        }
 
         // Suppressed when called as the inner step of translateRecord(), which
         // dispatches a single 'translate' event for the whole operation instead.
@@ -1825,6 +1843,37 @@ class WriteTableTool extends AbstractRecordTool
     }
 
     /**
+     * DataHandler counts the children of an inline or file field and indexes the relation while
+     * it writes the parent. Children linked to their parent after that run bypass both, so the
+     * counter column and sys_refindex are synced here. Without the sys_refindex rows the workspace
+     * dependency resolver does not see the children, and publishing the parent leaves them behind.
+     *
+     * @param int $uid live uid, or the uid of a record created in the workspace
+     * @param array<string, int> $childCounts fieldName => number of children
+     */
+    protected function syncInlineParentBookkeeping(string $table, int $uid, array $childCounts): void
+    {
+        $workspace = (int)($GLOBALS['BE_USER']->workspace ?? 0);
+        if ($workspace > 0) {
+            $version = BackendUtility::getWorkspaceVersionOfRecord($workspace, $table, $uid, 'uid');
+            if (is_array($version)) {
+                $uid = (int)$version['uid'];
+            } elseif ((int)(BackendUtility::getRecord($table, $uid, 't3ver_wsid')['t3ver_wsid'] ?? 0) !== $workspace) {
+                // A live row without a workspace version: never write live data.
+                return;
+            }
+        }
+
+        GeneralUtility::makeInstance(ConnectionPool::class)
+            ->getConnectionForTable($table)
+            ->update($table, $childCounts, ['uid' => $uid]);
+
+        // No public per-record API exists; this is what the referenceindex:update command uses.
+        GeneralUtility::makeInstance(ReferenceIndex::class)
+            ->updateRefIndexTable($table, $uid, false, $workspace);
+    }
+
+    /**
      * Resolve inline and file relations that sit on an embedded child record.
      *
      * extractInlineRelations() only inspects the top level of the written record, so a file
@@ -1982,6 +2031,7 @@ class WriteTableTool extends AbstractRecordTool
                         'foreignTableField' => (string)($config['foreign_table_field'] ?? ''),
                         'parentTable' => $table,
                         'parentKey' => $recordKey,
+                        'parentField' => $fieldName,
                     ];
                 }
             }
@@ -3002,17 +3052,18 @@ class WriteTableTool extends AbstractRecordTool
     {
         $pending = $this->pendingNestedForeignFields;
         $this->pendingNestedForeignFields = [];
+        $childrenByParent = [];
 
         foreach ($pending as $link) {
             $childUid = $this->resolveWrittenUid($dataHandler, $link['key']);
-            $parentUid = $this->resolveWrittenUid($dataHandler, $link['parentKey']);
+            $parentRecordUid = $this->resolveWrittenUid($dataHandler, $link['parentKey']);
 
-            if ($childUid === null || $parentUid === null) {
+            if ($childUid === null || $parentRecordUid === null) {
                 continue;
             }
 
             // Point at the live uid the way the top level does, so workspace overlays resolve.
-            $parentUid = $this->getLiveUid($link['parentTable'], $parentUid);
+            $parentUid = $this->getLiveUid($link['parentTable'], $parentRecordUid);
             $relationFields = [$link['foreignField'] => $parentUid];
             if ($link['foreignTableField'] !== '') {
                 $relationFields[$link['foreignTableField']] = $link['parentTable'];
@@ -3021,6 +3072,14 @@ class WriteTableTool extends AbstractRecordTool
             GeneralUtility::makeInstance(ConnectionPool::class)
                 ->getConnectionForTable($link['table'])
                 ->update($link['table'], $relationFields, ['uid' => $childUid]);
+
+            $childrenByParent[$link['parentTable']][$parentUid][$link['parentField']][$childUid] = true;
+        }
+
+        foreach ($childrenByParent as $parentTable => $parents) {
+            foreach ($parents as $parentUid => $fields) {
+                $this->syncInlineParentBookkeeping($parentTable, $parentUid, array_map('count', $fields));
+            }
         }
     }
 
