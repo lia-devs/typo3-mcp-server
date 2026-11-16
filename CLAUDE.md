@@ -1,5 +1,6 @@
 - This project is about developing the mcp_server typo3 extension, that allows someone without technical knowledge to edit content using LLM's.
 - Run the tests using `composer test`. Test must cover the TYPO3 integration.
+- LLM behavior tests (real models via OpenRouter, costs money): `composer test:llm -- --filter <Test>`, key in `.env.local` or `Tests/Llm/.env.local`. Outcome-based conversation tests with saved transcripts: Tests/Llm/LanguageNavigationTest.php.
 - Run E2E (Playwright) tests using `Build/runTests.sh -s e2e`. This spins up MySQL, TYPO3, and Playwright in Docker containers automatically. If Docker is unavailable, the script falls back to a local mode (host PHP + SQLite + local Playwright); this can also be forced with `-n` / `--no-docker`.
 - Read the TECHNICAL_OVERVIEW.md and documentation in the Documentation/Architecture/ folder to understand important design decisions and implementation details.
 - The Tools for LLMs don't need backwards compatibility. We can completely change parameters or even their names if it better describes them without it being a breaking change.
@@ -9,3 +10,4 @@
 - Always check if there is some typo3 core api that can be used for TCA related data actions.
 - If the TYPO3 instance has no language support, then hide all aspects of translation like parameters or even database fields. Check the LanguageService.php to check support.
 - Language overlays use TYPO3's PageRepository API while workspace overlays use custom implementation for transparency (see Documentation/Architecture/LanguageOverlays.md)
+- Tool output must be valid UTF-8 (cut strings with `mb_*`): the SDK's HTTP transport encodes with `JSON_THROW_ON_ERROR` and silently drops a response it cannot encode, so the client just times out.
