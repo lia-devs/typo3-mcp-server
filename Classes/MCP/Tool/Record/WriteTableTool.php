@@ -2136,7 +2136,9 @@ class WriteTableTool extends AbstractRecordTool
 
     /**
      * Take back the link of children linked in the workspace only: their workspace row
-     * points at no parent again, their live row never did.
+     * points at no parent again, their live row never did. A workspace version that held
+     * nothing but the link is discarded, so the record is as it was and nothing is left
+     * to publish; one with changes of its own keeps them.
      *
      * @param array $config TCA config of the parent's inline field
      * @param list<int> $childUids live uids
@@ -2151,6 +2153,11 @@ class WriteTableTool extends AbstractRecordTool
         if ($foreignTableField !== '') {
             $fields[$foreignTableField] = '';
         }
+        $relationFieldNames = [...array_keys($fields), ...array_keys($config['foreign_match_fields'] ?? [])];
+        $sortBy = (string)(($config['foreign_sortby'] ?? '') ?: ($GLOBALS['TCA'][$foreignTable]['ctrl']['sortby'] ?? ''));
+        if ($sortBy !== '') {
+            $relationFieldNames[] = $sortBy;
+        }
         $updatedAt = (string)($GLOBALS['TCA'][$foreignTable]['ctrl']['tstamp'] ?? '');
         if ($updatedAt !== '') {
             $fields[$updatedAt] = (int)$GLOBALS['EXEC_TIME'];
@@ -2159,10 +2166,62 @@ class WriteTableTool extends AbstractRecordTool
         $connection = GeneralUtility::makeInstance(ConnectionPool::class)->getConnectionForTable($foreignTable);
         $referenceIndex = GeneralUtility::makeInstance(ReferenceIndex::class);
         foreach ($childUids as $childUid) {
+            $this->changedIndependentChildren[$foreignTable][] = $childUid;
+            $version = $this->findWorkspaceVersionRow($foreignTable, $childUid, $workspaceId);
+            $live = BackendUtility::getRecord($foreignTable, $childUid);
+            if ($version !== null && is_array($live)
+                && VersionState::tryFrom((int)$version['t3ver_state']) === VersionState::DEFAULT_STATE
+                && $this->differsOnlyIn($foreignTable, $version, $live, $relationFieldNames)
+            ) {
+                $this->discardWorkspaceVersion($foreignTable, (int)$version['uid']);
+                continue;
+            }
             $rowUid = $this->getWorkspaceRowUid($foreignTable, $childUid, $workspaceId);
             $connection->update($foreignTable, $fields, ['uid' => $rowUid]);
             $referenceIndex->updateRefIndexTable($foreignTable, $rowUid, false, $workspaceId);
-            $this->changedIndependentChildren[$foreignTable][] = $childUid;
+        }
+    }
+
+    /**
+     * Whether a workspace version equals its live record apart from the given fields and
+     * the bookkeeping every version carries.
+     *
+     * @param array<string, mixed> $version
+     * @param array<string, mixed> $live
+     * @param list<string> $ignoredFields
+     */
+    protected function differsOnlyIn(string $table, array $version, array $live, array $ignoredFields): bool
+    {
+        $ctrl = $GLOBALS['TCA'][$table]['ctrl'] ?? [];
+        $ignored = array_flip(array_filter([
+            ...$ignoredFields,
+            'uid', 't3ver_oid', 't3ver_wsid', 't3ver_state', 't3ver_stage',
+            (string)($ctrl['tstamp'] ?? ''),
+            (string)($ctrl['crdate'] ?? ''),
+        ]));
+        foreach ($version as $field => $value) {
+            if (isset($ignored[$field])) {
+                continue;
+            }
+            if ((string)($live[$field] ?? '') !== (string)($value ?? '')) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * Discard a workspace version, as the workspace module's waste bin does: a delete
+     * command on the version itself.
+     */
+    protected function discardWorkspaceVersion(string $table, int $versionUid): void
+    {
+        $dataHandler = GeneralUtility::makeInstance(DataHandler::class);
+        $dataHandler->BE_USER = $GLOBALS['BE_USER'];
+        $dataHandler->start([], [$table => [$versionUid => ['delete' => 1]]]);
+        $dataHandler->process_cmdmap();
+        if ($dataHandler->errorLog !== []) {
+            throw new ValidationException(["The workspace version $table:$versionUid could not be discarded: " . implode(', ', $dataHandler->errorLog)]);
         }
     }
 
