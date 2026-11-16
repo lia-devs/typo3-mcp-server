@@ -335,6 +335,59 @@ class SharedIndependentChildrenTest extends FunctionalTestCase
     }
 
     /**
+     * Linked and unlinked again, a live record is as it was: its workspace version held
+     * nothing but the link and is discarded, so nothing is left to publish.
+     */
+    #[Test]
+    public function recordLinkedAndUnlinkedAgainKeepsNoWorkspaceVersion(): void
+    {
+        $this->write([
+            'table' => 'tt_content',
+            'action' => 'update',
+            'uid' => self::CONTENT_UID,
+            'data' => [self::FIELD => [self::CHILD_OF_CONTENT, self::UNLINKED_CHILD]],
+        ]);
+        $this->write([
+            'table' => 'tt_content',
+            'action' => 'update',
+            'uid' => self::CONTENT_UID,
+            'data' => [self::FIELD => [self::CHILD_OF_CONTENT]],
+        ]);
+
+        $this->assertFalse($this->hasWorkspaceVersion(self::UNLINKED_CHILD));
+        $this->assertSame(['parent_uid' => 0, 'parent_table' => ''], $this->getLiveRelationFields(self::UNLINKED_CHILD));
+    }
+
+    /**
+     * A workspace version that carries changes of its own stays; only the link is taken back.
+     */
+    #[Test]
+    public function recordChangedInTheWorkspaceKeepsItsVersionWhenUnlinked(): void
+    {
+        $this->write([
+            'table' => self::CHILD_TABLE,
+            'action' => 'update',
+            'uid' => self::UNLINKED_CHILD,
+            'data' => ['title' => 'Changed in the workspace'],
+        ]);
+        $this->write([
+            'table' => 'tt_content',
+            'action' => 'update',
+            'uid' => self::CONTENT_UID,
+            'data' => [self::FIELD => [self::CHILD_OF_CONTENT, self::UNLINKED_CHILD]],
+        ]);
+        $this->write([
+            'table' => 'tt_content',
+            'action' => 'update',
+            'uid' => self::CONTENT_UID,
+            'data' => [self::FIELD => [self::CHILD_OF_CONTENT]],
+        ]);
+
+        $this->assertTrue($this->hasWorkspaceVersion(self::UNLINKED_CHILD));
+        $this->assertSame(['parent_uid' => 0, 'parent_table' => ''], $this->getRelationFieldsInWorkspace(self::UNLINKED_CHILD));
+    }
+
+    /**
      * A child linked live is deleted when the list leaves it out, as in the backend form:
      * unlinked in the workspace only, publishing the parent would link it again.
      */
@@ -601,6 +654,22 @@ class SharedIndependentChildrenTest extends FunctionalTestCase
     private function getLiveRelationFields(int $liveUid): array
     {
         return $this->toRelationFields($this->fetchLiveRow($liveUid));
+    }
+
+    private function hasWorkspaceVersion(int $liveUid): bool
+    {
+        $queryBuilder = GeneralUtility::makeInstance(ConnectionPool::class)->getQueryBuilderForTable(self::CHILD_TABLE);
+        $queryBuilder->getRestrictions()->removeAll();
+        return $queryBuilder
+            ->count('uid')
+            ->from(self::CHILD_TABLE)
+            ->where(
+                $queryBuilder->expr()->eq('t3ver_wsid', $queryBuilder->createNamedParameter((int)$GLOBALS['BE_USER']->workspace)),
+                $queryBuilder->expr()->eq('t3ver_oid', $queryBuilder->createNamedParameter($liveUid)),
+                $queryBuilder->expr()->eq('deleted', $queryBuilder->createNamedParameter(0))
+            )
+            ->executeQuery()
+            ->fetchOne() > 0;
     }
 
     private function isDeletedInWorkspace(int $liveUid): bool

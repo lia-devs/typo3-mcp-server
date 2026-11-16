@@ -121,7 +121,9 @@ On update the list replaces the linked records. A record left out that is linked
 detached state for an independent child that survives publishing - publishing the parent points
 every child whose live row names it back at it, so a child only unlinked in the workspace would be
 linked again live. A record left out that was linked in the workspace only gets that link taken
-back and stays the record of its own it was before.
+back and stays the record of its own it was before; if its workspace version held nothing but the
+link (pointer, parent table, match fields, position), the version is discarded, so nothing is left
+to publish.
 The list order is the children's order, numbered like RelationHandler does (`foreign_sortby`, else
 the child table's `sortby`).
 
