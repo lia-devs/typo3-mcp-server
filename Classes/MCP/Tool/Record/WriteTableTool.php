@@ -11,6 +11,7 @@ use Hn\McpServer\Exception\DatabaseException;
 use Hn\McpServer\Exception\ValidationException;
 use Hn\McpServer\Service\InlineParentService;
 use Hn\McpServer\Service\LanguageService;
+use Hn\McpServer\Service\RecordUrlService;
 use Mcp\Types\CallToolResult;
 use Psr\EventDispatcher\EventDispatcherInterface;
 use TYPO3\CMS\Backend\Utility\BackendUtility;
@@ -58,11 +59,14 @@ class WriteTableTool extends AbstractRecordTool
         $languageHint = $hasMultipleLanguages
             ? ' Language fields (sys_language_uid) can be provided as ISO codes (e.g., "de", "fr") instead of numeric IDs.'
             : '';
+        $previewHint = GeneralUtility::makeInstance(RecordUrlService::class)->isPreviewLinkEnabled()
+            ? ' For records shown on the website, the result contains a preview_url: a temporary link that shows the unpublished change without login, offer it to the user to review the change.'
+            : '';
 
         return [
             'description' => 'Create, update, translate, or delete records in a TYPO3 workspace. ' .
                 'Changes are NOT published live — they land in a workspace and stay invisible to website visitors until a human editor publishes them in the TYPO3 backend. ' .
-                'This tool cannot publish; if the user wants the change live, tell them to publish the workspace in the TYPO3 backend (or ask an editor to), never claim the change is already live.' . $languageHint . ' ' .
+                'This tool cannot publish; if the user wants the change live, tell them to publish the workspace in the TYPO3 backend (or ask an editor to), never claim the change is already live.' . $previewHint . $languageHint . ' ' .
                 'Before creating or updating content, always use GetPage to understand the page structure, existing content, and writing style. ' .
                 'Check existing content elements with ReadTable to ensure new content fits the page\'s tone and doesn\'t duplicate existing elements. ' .
                 'For content creation, verify the appropriate colPos by examining existing content layout. ' .
@@ -535,7 +539,7 @@ class WriteTableTool extends AbstractRecordTool
             'action' => 'create',
             'table' => $table,
             'uid' => $liveUid,
-        ]);
+        ] + $this->getRecordUrls($table, $liveUid));
     }
     
     /**
@@ -654,12 +658,13 @@ class WriteTableTool extends AbstractRecordTool
             $eventDispatcher->dispatch(new AfterRecordWriteEvent($table, 'update', $uid, $data, null));
         }
 
-        // Return the result with the original live UID
+        // Return the result with the original live UID. The URLs are left to the
+        // caller when this is the inner step of translateRecord().
         return $this->createJsonResult([
             'action' => 'update',
             'table' => $table,
             'uid' => $uid, // Return the live UID that was passed in
-        ]);
+        ] + ($dispatchEvent ? $this->getRecordUrls($table, $uid) : []));
     }
     
     /**
@@ -1169,7 +1174,53 @@ class WriteTableTool extends AbstractRecordTool
             'sourceUid' => $uid,
             'translationUid' => $newTranslationUid ?: 'Translation created but UID not found',
             'targetLanguage' => $targetIsoCode,
-        ]);
+        ] + ($newTranslationUid ? $this->getRecordUrls($table, (int)$newTranslationUid) : []));
+    }
+
+    /**
+     * frontend_url / preview_url of a record that was just written, so the result
+     * of an edit can be shown right away. Empty for records without a frontend view.
+     *
+     * @return array{frontend_url?: string, preview_url?: string}
+     */
+    protected function getRecordUrls(string $table, int $uid): array
+    {
+        try {
+            $record = BackendUtility::getRecordWSOL($table, $uid);
+            if (!is_array($record)) {
+                return [];
+            }
+            return GeneralUtility::makeInstance(RecordUrlService::class)->getUrls($table, [$record])[0] ?? [];
+        } catch (\Throwable $e) {
+            // The write itself succeeded, a missing link must not turn it into an error
+            $this->logException($e, sprintf('resolving URLs of %s:%d', $table, $uid));
+            return [];
+        }
+    }
+
+    /**
+     * Record type a record has after a write, as the backend form sees it.
+     *
+     * A type given in the data wins. Otherwise an existing record keeps its type,
+     * taken from the workspace version the write goes to (it may differ from the
+     * live row). A new record gets the TCA default of the type field. Tables
+     * without a local type field have no record type ('').
+     *
+     * @param array|null $existingRecord Existing record with workspace overlay applied, null for new records
+     */
+    protected function resolveRecordType(string $table, array $data, ?array $existingRecord): string
+    {
+        $typeField = $this->tableAccessService->getTypeFieldName($table);
+        if ($typeField === null || $typeField === '') {
+            return '';
+        }
+        if (isset($data[$typeField]) && is_scalar($data[$typeField])) {
+            return (string)$data[$typeField];
+        }
+        if ($existingRecord !== null) {
+            return (string)($existingRecord[$typeField] ?? '');
+        }
+        return (string)($GLOBALS['TCA'][$table]['columns'][$typeField]['config']['default'] ?? '');
     }
 
     /**
@@ -1206,6 +1257,7 @@ class WriteTableTool extends AbstractRecordTool
         }
 
         // Build merged record context for dynamic select item resolution (itemsProcFunc, TSconfig)
+        $currentRecord = null;
         if ($action === 'update' && $uid) {
             $existingRecord = BackendUtility::getRecord($table, $uid) ?? [];
 
@@ -1278,6 +1330,12 @@ class WriteTableTool extends AbstractRecordTool
             }
         }
 
+        // Record type the record has after this write. TCEFORM may disable a field
+        // globally and re-enable it for single types (or the other way round), so
+        // the access check below has to know it, just like the backend form does.
+        $typeField = $this->tableAccessService->getTypeFieldName($table);
+        $recordType = $this->resolveRecordType($table, $data, $currentRecord);
+
         // Validate and convert field values
         foreach ($data as $fieldName => $value) {
             $fieldConfig = $this->tableAccessService->getFieldConfig($table, $fieldName);
@@ -1285,8 +1343,9 @@ class WriteTableTool extends AbstractRecordTool
                 continue;
             }
 
-            // Check if field is accessible (filters out inaccessible inline relations)
-            if (!$this->tableAccessService->canAccessField($table, $fieldName, '', $tsConfigPid)) {
+            // Check if field is accessible (exclude fields, inaccessible inline
+            // relations, TCEFORM disabled for this page and record type)
+            if (!$this->tableAccessService->canAccessField($table, $fieldName, $recordType, $tsConfigPid)) {
                 return "Field '{$fieldName}' is not accessible";
             }
 
@@ -1333,25 +1392,7 @@ class WriteTableTool extends AbstractRecordTool
         
         // After validating all field values, check field availability based on record type
         // This ensures type field validation happens first
-        $recordType = '';
-        $typeField = $this->tableAccessService->getTypeFieldName($table);
-        if ($typeField) {
-            if ($action === 'update' && $uid !== null) {
-                // For updates, fetch the current record type
-                $currentRecord = BackendUtility::getRecord($table, $uid, $typeField);
-                if ($currentRecord && isset($currentRecord[$typeField])) {
-                    $recordType = (string)$currentRecord[$typeField];
-                }
-                // If type is being changed in the update, use the new type
-                if (isset($data[$typeField])) {
-                    $recordType = (string)$data[$typeField];
-                }
-            } else {
-                // For creates, get type from data
-                $recordType = isset($data[$typeField]) ? (string)$data[$typeField] : '';
-            }
-        }
-        
+
         // Get available fields for this record type. Handed no page, this resolves
         // TCEFORM at a fallback page, which drops fields that page TSconfig enables
         // only where the record actually lives. Use the same page as the per-field
@@ -2268,15 +2309,33 @@ class WriteTableTool extends AbstractRecordTool
         // Collect all field names we need to fetch
         $fieldNames = array_keys($searchReplace);
 
-        // Validate all fields exist, are accessible, and are string-type before fetching the record.
-        // Field access MUST be checked before any DB read to prevent information disclosure
-        // via search/replace error messages ("not found" / "found N times").
+        // Fetch full record with workspace overlay to get the current workspace version data,
+        // which is what the LLM sees from ReadTable output.
+        // We fetch all fields because workspaceOL needs uid and workspace metadata fields.
+        $record = BackendUtility::getRecord($table, $uid);
+        if (is_array($record)) {
+            BackendUtility::workspaceOL($table, $record);
+        }
+
+        // Field access depends on the page and record type (TCEFORM disabled per type),
+        // resolved the same way as in validateRecordData(): a page record is its own
+        // TSconfig context, any other record the page it lives on.
+        $recordType = is_array($record) ? $this->resolveRecordType($table, [], $record) : '';
+        $tsConfigPid = null;
+        if (is_array($record)) {
+            $tsConfigPid = $table === 'pages' ? $uid : (int)($record['pid'] ?? 0);
+        }
+
+        // Validate all fields exist, are accessible, and are string-type before touching
+        // the field values. Field access MUST be checked before any value is compared to
+        // prevent information disclosure via search/replace error messages
+        // ("not found" / "found N times").
         foreach ($fieldNames as $fieldName) {
             $fieldConfig = $this->tableAccessService->getFieldConfig($table, $fieldName);
             if (!$fieldConfig) {
                 throw new ValidationException(["search_replace field '{$fieldName}' does not exist in table '{$table}'"]);
             }
-            if (!$this->tableAccessService->canAccessField($table, $fieldName)) {
+            if (!$this->tableAccessService->canAccessField($table, $fieldName, $recordType, $tsConfigPid)) {
                 throw new ValidationException(["Field '{$fieldName}' is not accessible"]);
             }
             $fieldType = $fieldConfig['config']['type'] ?? '';
@@ -2285,14 +2344,9 @@ class WriteTableTool extends AbstractRecordTool
             }
         }
 
-        // Fetch full record with workspace overlay to get the current workspace version data,
-        // which is what the LLM sees from ReadTable output.
-        // We fetch all fields because workspaceOL needs uid and workspace metadata fields.
-        $record = BackendUtility::getRecord($table, $uid);
-        if (!$record) {
+        if (!is_array($record)) {
             throw new ValidationException(["Record {$uid} not found in table '{$table}'"]);
         }
-        BackendUtility::workspaceOL($table, $record);
 
         $resolved = [];
         foreach ($searchReplace as $fieldName => $operations) {
