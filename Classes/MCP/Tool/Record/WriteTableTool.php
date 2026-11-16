@@ -17,6 +17,7 @@ use Psr\EventDispatcher\EventDispatcherInterface;
 use TYPO3\CMS\Backend\Utility\BackendUtility;
 use TYPO3\CMS\Core\Configuration\FlexForm\FlexFormTools;
 use TYPO3\CMS\Core\DataHandling\DataHandler;
+use TYPO3\CMS\Core\Information\Typo3Version;
 use TYPO3\CMS\Core\Utility\GeneralUtility;
 use TYPO3\CMS\Core\Database\ConnectionPool;
 use TYPO3\CMS\Core\Versioning\VersionState;
@@ -2346,14 +2347,20 @@ class WriteTableTool extends AbstractRecordTool
     }
 
     /**
-     * Discard a workspace version, as the workspace module's waste bin does: a delete
-     * command on the version itself.
+     * Discard a workspace version with the command the workspace module sends: `discard`
+     * on 14, `version`/`clearWSID` on 13, which knows no `discard` command. A `delete`
+     * command on the version is no discard: 14.3.11 turns the version into a delete
+     * placeholder (14.3.7 still discarded it), which would delete the live record on
+     * publishing.
      */
     protected function discardWorkspaceVersion(string $table, int $versionUid): void
     {
+        $command = GeneralUtility::makeInstance(Typo3Version::class)->getMajorVersion() >= 14
+            ? ['discard' => true]
+            : ['version' => ['action' => 'clearWSID']];
         $dataHandler = GeneralUtility::makeInstance(DataHandler::class);
         $dataHandler->BE_USER = $GLOBALS['BE_USER'];
-        $dataHandler->start([], [$table => [$versionUid => ['delete' => 1]]]);
+        $dataHandler->start([], [$table => [$versionUid => $command]]);
         $dataHandler->process_cmdmap();
         if ($dataHandler->errorLog !== []) {
             throw new ValidationException(["The workspace version $table:$versionUid could not be discarded: " . implode(', ', $dataHandler->errorLog)]);
