@@ -6,6 +6,7 @@ namespace Hn\McpServer\Http;
 
 use Hn\McpServer\Service\McpAuthenticationException;
 use Hn\McpServer\Service\McpAuthenticationService;
+use Hn\McpServer\Service\TableAccessService;
 use Psr\Http\Message\ResponseInterface;
 use Psr\Http\Message\ServerRequestInterface;
 use TYPO3\CMS\Core\Http\Response;
@@ -63,6 +64,13 @@ class FilePreviewEndpoint
         try {
             $file = $resourceFactory->getFileObject($fileUid);
         } catch (\Throwable) {
+            return $this->errorResponse('File not found: uid ' . $fileUid, 404);
+        }
+
+        // sys_file uids are sequential and guessable, so the uid alone must not
+        // be enough: the file has to lie within the user's file mounts. Same
+        // answer as for a missing file, which does not tell which uids exist.
+        if (!GeneralUtility::makeInstance(TableAccessService::class)->canAccessFileUid($fileUid)) {
             return $this->errorResponse('File not found: uid ' . $fileUid, 404);
         }
 

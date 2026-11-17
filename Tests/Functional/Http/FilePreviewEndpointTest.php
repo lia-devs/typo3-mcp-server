@@ -11,6 +11,7 @@ use TYPO3\CMS\Core\Cache\CacheManager;
 use TYPO3\CMS\Core\Database\ConnectionPool;
 use TYPO3\CMS\Core\Http\ServerRequest;
 use TYPO3\CMS\Core\Http\Uri;
+use TYPO3\CMS\Core\Resource\StorageRepository;
 use TYPO3\CMS\Core\Utility\GeneralUtility;
 use TYPO3\TestingFramework\Core\Functional\FunctionalTestCase;
 
@@ -120,5 +121,60 @@ class FilePreviewEndpointTest extends FunctionalTestCase
             ->delete('be_users', ['uid' => $userUid]);
 
         self::assertSame(401, $this->requestPreview($token, ['uid' => 1])->getStatusCode());
+    }
+
+    /**
+     * Create an 8x8 PNG below fileadmin/ and index it.
+     */
+    protected function createImage(string $identifier): int
+    {
+        $path = $this->instancePath . '/fileadmin' . $identifier;
+        GeneralUtility::mkdir_deep(dirname($path));
+        $image = imagecreatetruecolor(8, 8);
+        imagepng($image, $path);
+
+        // Indexing needs a user context; the requests below bring their own
+        $GLOBALS['BE_USER'] = $this->setUpBackendUser(1);
+        $uid = GeneralUtility::makeInstance(StorageRepository::class)->findByUid(1)->getFile($identifier)->getUid();
+        unset($GLOBALS['BE_USER']);
+
+        return $uid;
+    }
+
+    public function testAFileWithinTheFileMountsIsServed(): void
+    {
+        $fileUid = $this->createImage('/user_upload/visible.png');
+        $token = $this->tokenFor($this->createEditor(['file_mountpoints' => '1']));
+
+        $response = $this->requestPreview($token, ['uid' => $fileUid]);
+
+        self::assertSame(200, $response->getStatusCode(), (string)$response->getBody());
+        self::assertStringStartsWith('image/', $response->getHeaderLine('Content-Type'));
+    }
+
+    public function testAFileOutsideTheFileMountsIsNotServed(): void
+    {
+        $fileUid = $this->createImage('/secret/hidden.png');
+        $token = $this->tokenFor($this->createEditor(['file_mountpoints' => '1']));
+
+        $response = $this->requestPreview($token, ['uid' => $fileUid]);
+
+        self::assertSame(404, $response->getStatusCode(), 'A guessed uid must not be enough to read a file');
+        self::assertStringNotContainsString('image/', $response->getHeaderLine('Content-Type'));
+    }
+
+    public function testAUserWithoutFileMountsGetsNoFile(): void
+    {
+        $fileUid = $this->createImage('/user_upload/visible.png');
+        $token = $this->tokenFor($this->createEditor());
+
+        self::assertSame(404, $this->requestPreview($token, ['uid' => $fileUid])->getStatusCode());
+    }
+
+    public function testAnAdminGetsEveryFile(): void
+    {
+        $fileUid = $this->createImage('/secret/hidden.png');
+
+        self::assertSame(200, $this->requestPreview($this->tokenFor(1), ['uid' => $fileUid])->getStatusCode());
     }
 }

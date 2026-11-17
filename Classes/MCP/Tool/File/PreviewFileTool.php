@@ -146,6 +146,11 @@ class PreviewFileTool extends AbstractRecordTool
         } else {
             $file = $resourceFactory->getFileObjectFromCombinedIdentifier($identifier);
         }
+        if (!$this->isFileAccessible($file)) {
+            return $this->createErrorResult(
+                'File not found or outside your file mounts: ' . ($fileUid > 0 ? 'uid ' . $fileUid : $identifier)
+            );
+        }
 
         $mimeType = $file->getMimeType();
         $metadata = $this->buildMetadataText($file, $mimeType);
@@ -211,6 +216,11 @@ class PreviewFileTool extends AbstractRecordTool
                 continue;
             }
 
+            if (!$this->isFileAccessible($file)) {
+                $content[] = new TextContent(sprintf('uid:%d | not available (outside your file mounts)', $uid));
+                continue;
+            }
+
             $mimeType = $file->getMimeType();
             $content[] = new TextContent($this->buildMetadataText($file, $mimeType));
 
@@ -233,6 +243,17 @@ class PreviewFileTool extends AbstractRecordTool
         }
 
         return new CallToolResult($content);
+    }
+
+    /**
+     * Neither ResourceFactory::getFileObject() nor File::process() asks whether
+     * the user may read the file, so a uid or identifier alone would hand out
+     * any file of the installation. The file has to lie within the user's file
+     * mounts, like the rows ReadTable returns for sys_file.
+     */
+    private function isFileAccessible(File $file): bool
+    {
+        return $this->tableAccessService->canAccessFileUid($file->getUid());
     }
 
     /**
