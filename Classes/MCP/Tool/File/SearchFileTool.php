@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Hn\McpServer\MCP\Tool\File;
 
+use Hn\McpServer\EventListener\SysFileMountRestrictionListener;
 use Hn\McpServer\MCP\Tool\Record\AbstractRecordTool;
 use Mcp\Types\CallToolResult;
 use Mcp\Types\ImageContent;
@@ -143,6 +144,14 @@ class SearchFileTool extends AbstractRecordTool
             $queryBuilder->andWhere(
                 $queryBuilder->expr()->eq('storage', $queryBuilder->createNamedParameter($storageUid, ParameterType::INTEGER))
             );
+        }
+
+        // Only files within the user's file mounts, as ReadTable does for
+        // sys_file: this query bypasses FAL, which would otherwise list (and
+        // thumbnail) every file of every storage for any authenticated user.
+        $mountRestriction = SysFileMountRestrictionListener::buildSysFileMountRestriction($queryBuilder);
+        if ($mountRestriction !== null) {
+            $queryBuilder->andWhere($mountRestriction);
         }
 
         $queryBuilder->orderBy('modification_date', 'DESC');
