@@ -108,6 +108,7 @@ class OAuthPageShellTest extends AbstractFunctionalTest
                 'host' => 'staging.example.test',
                 'username' => 'tester',
                 'client_name' => 'Claude',
+                'destination' => 'client.example',
                 'client_id' => 'mcp_1',
                 'redirect_uri' => 'https://client.example/cb',
                 'code_challenge' => 'chal',
