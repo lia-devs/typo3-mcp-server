@@ -9,6 +9,8 @@ use Hn\McpServer\Service\SiteInformationService;
 use Mcp\Types\ImageContent;
 use Mcp\Types\TextContent;
 use PHPUnit\Framework\Attributes\Test;
+use TYPO3\CMS\Core\Context\Context;
+use TYPO3\CMS\Core\Context\FileProcessingAspect;
 use TYPO3\CMS\Core\Core\Environment;
 use TYPO3\CMS\Core\Http\NormalizedParams;
 use TYPO3\CMS\Core\Http\ServerRequest;
@@ -47,6 +49,10 @@ class PreviewFileToolTest extends FunctionalTestCase
 
         $GLOBALS['LANG'] = GeneralUtility::makeInstance(LanguageServiceFactory::class)->create('default');
         $GLOBALS['BE_USER'] = $this->setUpBackendUser(1);
+        // As the MCP endpoints do: deferred image processing needs a backend
+        // session with CSRF tokens, which a Bearer request does not have.
+        GeneralUtility::makeInstance(Context::class)
+            ->setAspect('fileProcessing', new FileProcessingAspect(false));
 
         $base = $this->instancePath . '/fileadmin';
         @mkdir($base . '/images', 0777, true);
