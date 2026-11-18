@@ -20,6 +20,7 @@ use Psr\Http\Message\ServerRequestInterface;
 use Psr\Http\Server\MiddlewareInterface;
 use Psr\Http\Server\RequestHandlerInterface;
 use TYPO3\CMS\Core\Context\Context;
+use TYPO3\CMS\Core\Core\SystemEnvironmentBuilder;
 use TYPO3\CMS\Core\Http\Response;
 use TYPO3\CMS\Core\Http\Stream;
 use TYPO3\CMS\Core\Utility\GeneralUtility;
@@ -50,6 +51,19 @@ class McpServerMiddleware implements MiddlewareInterface
             } elseif (str_starts_with($path, $sitePath . '/')) {
                 $path = substr($path, strlen($sitePath));
             }
+        }
+
+        // Both endpoints below run MCP tools, and those reach into core APIs that
+        // still read $GLOBALS['TYPO3_REQUEST']: DataHandler's RTE transformation,
+        // for instance, validates href values through DefaultSanitizerBuilder,
+        // whose closure throws a RuntimeException (1775675289) without an active
+        // request. This middleware answers the routes itself, so the core
+        // RequestHandler that usually publishes the request never runs for them.
+        // Tools act as an authenticated backend user, and a frontend-typed request
+        // without site, language and TypoScript breaks Extbase and Locales.
+        if ($path === '/mcp' || $path === '/mcp_upload') {
+            $request = $request->withAttribute('applicationType', SystemEnvironmentBuilder::REQUESTTYPE_BE);
+            $GLOBALS['TYPO3_REQUEST'] = $request;
         }
 
         // Route to appropriate endpoint
