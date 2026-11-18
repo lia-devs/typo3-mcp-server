@@ -10,6 +10,8 @@ use Mcp\Types\CallToolResult;
 use Mcp\Types\ImageContent;
 use Mcp\Types\TextContent;
 use TYPO3\CMS\Core\Cache\CacheManager;
+use TYPO3\CMS\Core\Context\Context;
+use TYPO3\CMS\Core\Context\FileProcessingAspect;
 use TYPO3\CMS\Core\Database\ConnectionPool;
 use TYPO3\CMS\Core\Resource\StorageRepository;
 use TYPO3\CMS\Core\Utility\GeneralUtility;
@@ -70,6 +72,12 @@ class PreviewFileMountRestrictionTest extends FunctionalTestCase
         ]);
         GeneralUtility::makeInstance(CacheManager::class)->getCache('runtime')->flush();
         GeneralUtility::makeInstance(BackendUserContextService::class)->impersonate((int)$connection->lastInsertId());
+        // As the MCP endpoints do: deferred image processing needs a backend
+        // session with CSRF tokens, which a Bearer request does not have. Without
+        // it, a backend request left in $GLOBALS['TYPO3_REQUEST'] by an earlier
+        // test in the same process would defer the previews.
+        GeneralUtility::makeInstance(Context::class)
+            ->setAspect('fileProcessing', new FileProcessingAspect(false));
     }
 
     private function textOf(CallToolResult $result): string
