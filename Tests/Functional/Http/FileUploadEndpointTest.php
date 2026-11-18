@@ -37,9 +37,19 @@ class FileUploadEndpointTest extends FunctionalTestCase
         'mcp_server',
     ];
 
+    private bool $hadPreviousRequest = false;
+    private mixed $previousRequest = null;
+
     protected function setUp(): void
     {
         parent::setUp();
+        // The upload goes through McpServerMiddleware, which publishes its
+        // request as $GLOBALS['TYPO3_REQUEST'] - a backend request. Left behind,
+        // it changes how later tests in the same process behave: image
+        // processing is deferred for backend requests, so a test that counts
+        // previews finds none.
+        $this->hadPreviousRequest = array_key_exists('TYPO3_REQUEST', $GLOBALS);
+        $this->previousRequest = $GLOBALS['TYPO3_REQUEST'] ?? null;
         $this->importCSVDataSet(__DIR__ . '/../Fixtures/be_users.csv');
         $this->importCSVDataSet(__DIR__ . '/../Fixtures/pages.csv');
 
@@ -54,6 +64,18 @@ class FileUploadEndpointTest extends FunctionalTestCase
         GeneralUtility::writeFile($siteDir . '/config.yaml', "rootPageId: 1\nbase: 'https://example.com/'\n", true);
 
         $this->setUpBackendUser(1);
+    }
+
+    protected function tearDown(): void
+    {
+        // Restore an absent global as absent: assigning null would leave a key
+        // that later tests can tell apart with array_key_exists().
+        if ($this->hadPreviousRequest) {
+            $GLOBALS['TYPO3_REQUEST'] = $this->previousRequest;
+        } else {
+            unset($GLOBALS['TYPO3_REQUEST']);
+        }
+        parent::tearDown();
     }
 
     /**
