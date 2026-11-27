@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Hn\McpServer\MCP;
 
 use Composer\InstalledVersions;
+use Hn\McpServer\Service\RequestTimeService;
 use Mcp\Server\Server;
 use Mcp\Server\InitializationOptions;
 use Mcp\Server\NotificationOptions;
@@ -27,7 +28,8 @@ class McpServerFactory
     private const PACKAGE = 'hn/typo3-mcp-server';
 
     public function __construct(
-        private readonly ToolRegistry $toolRegistry
+        private readonly ToolRegistry $toolRegistry,
+        private readonly RequestTimeService $requestTimeService
     ) {}
 
     /**
@@ -111,6 +113,7 @@ class McpServerFactory
     private function registerHandlers(Server $server, ?callable $debugLogger): void
     {
         $toolRegistry = $this->toolRegistry;
+        $requestTimeService = $this->requestTimeService;
         $debug = $debugLogger ?? static fn($msg) => null;
 
         // Register tool/list handler
@@ -136,7 +139,11 @@ class McpServerFactory
         });
 
         // Register tool/call handler
-        $server->registerHandler('tools/call', static function ($params) use ($toolRegistry, $debug) {
+        $server->registerHandler('tools/call', static function ($params) use ($toolRegistry, $requestTimeService, $debug) {
+            // A stdio server runs for a whole client session: give each call
+            // its own request time, before any listener or tool reads it
+            $requestTimeService->refresh();
+
             $toolName = $params->name;
             $arguments = $params->arguments;
 
