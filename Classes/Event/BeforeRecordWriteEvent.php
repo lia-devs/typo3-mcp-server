@@ -12,6 +12,12 @@ namespace Hn\McpServer\Event;
  * - Modify data before validation and storage (auto-populate fields, normalize values)
  * - Veto the operation with a reason (custom access control, policy enforcement)
  * - Distinguish AI-originated writes from human-originated writes
+ *
+ * Independent inline children written along with a record (created, updated,
+ * or deleted because an update no longer lists them) get an event of their own,
+ * dispatched after the parent's and before anything is written, so a veto on
+ * any of them stops the whole write. Embedded children (hidden tables such as
+ * sys_file_reference) are part of the parent's data.
  */
 final class BeforeRecordWriteEvent
 {

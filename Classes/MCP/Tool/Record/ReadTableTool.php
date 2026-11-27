@@ -16,6 +16,7 @@ use Psr\EventDispatcher\EventDispatcherInterface;
 use TYPO3\CMS\Core\Database\Connection;
 use TYPO3\CMS\Core\Database\ConnectionPool;
 use TYPO3\CMS\Core\Database\Query\QueryBuilder;
+use TYPO3\CMS\Core\Database\RelationHandler;
 use TYPO3\CMS\Core\Database\Query\Restriction\DeletedRestriction;
 use TYPO3\CMS\Core\Database\Query\Restriction\WorkspaceRestriction;
 use Hn\McpServer\Database\Query\Restriction\WorkspaceDeletePlaceholderRestriction;
@@ -23,6 +24,7 @@ use Hn\McpServer\Service\LanguageService;
 use TYPO3\CMS\Backend\Utility\BackendUtility;
 use TYPO3\CMS\Core\Service\FlexFormService;
 use TYPO3\CMS\Core\Utility\GeneralUtility;
+use TYPO3\CMS\Core\Versioning\VersionState;
 
 /**
  * Tool for reading records from TYPO3 tables
@@ -553,10 +555,14 @@ class ReadTableTool extends AbstractRecordTool
 
                 if ($hasFlexFormConfig) {
                     // The bypass exists so plugin pi_flexform survives the
-                    // type-filter (line below). But an explicit field
-                    // whitelist must still be respected — otherwise a caller
-                    // asking for {"fields":["uid","header"]} unexpectedly gets
-                    // a (potentially large) FlexForm payload back.
+                    // type-filter (line below). The field permissions still
+                    // apply: exclude field grants and TCEFORM "disabled".
+                    if (!$this->tableAccessService->canAccessField($table, $field, $recordType, $tsConfigPid)) {
+                        continue;
+                    }
+                    // An explicit field whitelist must be respected as well —
+                    // otherwise a caller asking for {"fields":["uid","header"]}
+                    // unexpectedly gets a (potentially large) FlexForm payload back.
                     if (!empty($requestedFields) && !in_array($field, $requestedFields, true)) {
                         continue;
                     }
@@ -831,24 +837,93 @@ class ReadTableTool extends AbstractRecordTool
 
     /**
      * Include MM relations for a field
+     *
+     * The records carry the live uid. A live record edited in the workspace has a
+     * version with its own uid, and its workspace MM relations point to that version
+     * uid. RelationHandler reads them the way the backend does: it drops relations of
+     * other workspaces and related records deleted in the workspace. In a workspace
+     * the related side is stored by the uid of its workspace version, if it has one
+     * (RelationHandler::convertItemArray()), so those uids are mapped back to live
+     * uids for the client.
      */
     protected function includeMmRelations(array &$records, string $fieldName, array $fieldConfig, string $table): void
     {
-        $mmTable = $fieldConfig['config']['MM'];
+        $config = $fieldConfig['config'];
+        $workspaceId = (int)($GLOBALS['BE_USER']->workspace ?? 0);
+        $isVersionedInWorkspace = $workspaceId > 0 && !empty($GLOBALS['TCA'][$table]['ctrl']['versioningWS']);
 
-        // Get MM values for all records
         foreach ($records as &$record) {
-            if (isset($record['uid'])) {
-                $mmValues = $this->getMmRelationValues(
-                    $mmTable,
-                    $table,
-                    $record['uid'],
-                    $fieldName,
-                    $fieldConfig['config']
-                );
-                $record[$fieldName] = $mmValues;
+            if (!isset($record['uid'])) {
+                continue;
             }
+            $liveUid = (int)$record['uid'];
+            $baseRecord = ['uid' => $liveUid, 't3ver_oid' => 0];
+            if ($isVersionedInWorkspace) {
+                $version = BackendUtility::getWorkspaceVersionOfRecord($workspaceId, $table, $liveUid, 'uid');
+                if (is_array($version) && (int)$version['uid'] !== $liveUid) {
+                    $baseRecord = ['uid' => (int)$version['uid'], 't3ver_oid' => $liveUid];
+                }
+            }
+
+            $relationHandler = GeneralUtility::makeInstance(RelationHandler::class);
+            $relationHandler->setWorkspaceId($workspaceId);
+            $relationHandler->initializeForField($table, $config, $baseRecord);
+            $relationHandler->processDeletePlaceholder();
+
+            $uids = array_map(static fn(array $item): int => (int)$item['id'], $relationHandler->itemArray);
+            $uids = $this->resolveRelatedVersionUids($config['foreign_table'] ?? '', $uids);
+            $record[$fieldName] = array_values(array_unique($uids));
         }
+    }
+
+    /**
+     * Replace uids of workspace versions by the uid of their live record and drop
+     * related records deleted in the workspace (delete placeholders). Records that are
+     * new in the workspace keep their uid, the order is kept.
+     *
+     * Needed where the related side owns the stored version uid, e.g. a category edited
+     * or deleted in the workspace: RelationHandler::processDeletePlaceholder() only
+     * recognises live uids.
+     *
+     * @param int[] $uids
+     * @return int[]
+     */
+    protected function resolveRelatedVersionUids(string $foreignTable, array $uids): array
+    {
+        if ($uids === [] || empty($GLOBALS['TCA'][$foreignTable]['ctrl']['versioningWS'])) {
+            return $uids;
+        }
+
+        $queryBuilder = GeneralUtility::makeInstance(ConnectionPool::class)->getQueryBuilderForTable($foreignTable);
+        $queryBuilder->getRestrictions()->removeAll();
+        $rows = $queryBuilder
+            ->select('uid', 't3ver_oid', 't3ver_state')
+            ->from($foreignTable)
+            ->where(
+                $queryBuilder->expr()->in('uid', $queryBuilder->createNamedParameter($uids, Connection::PARAM_INT_ARRAY)),
+                $queryBuilder->expr()->gt('t3ver_oid', 0)
+            )
+            ->executeQuery()
+            ->fetchAllAssociative();
+
+        $versions = [];
+        foreach ($rows as $row) {
+            $versions[(int)$row['uid']] = $row;
+        }
+
+        $resolved = [];
+        foreach ($uids as $uid) {
+            if (!isset($versions[$uid])) {
+                $resolved[] = $uid;
+                continue;
+            }
+            if ((int)$versions[$uid]['t3ver_state'] === VersionState::DELETE_PLACEHOLDER->value) {
+                continue;
+            }
+            $resolved[] = (int)$versions[$uid]['t3ver_oid'];
+        }
+
+        return $resolved;
     }
 
     /**
@@ -944,7 +1019,7 @@ class ReadTableTool extends AbstractRecordTool
         if (!empty($fieldConfig['config']['foreign_table_field'])) {
             $foreignMatchFields[$fieldConfig['config']['foreign_table_field']] = $parentTable;
         }
-        $relatedRecords =$this->getInlineRelatedRecords($foreignTable, $foreignField, $recordUids, $foreignSortBy, $foreignMatchFields, $isHiddenTable);
+        $relatedRecords = $this->getInlineRelatedRecords($foreignTable, $foreignField, $recordUids, $foreignSortBy, $foreignMatchFields, $isHiddenTable);
 
         // Allow listeners to enrich or redact inline children (e.g. attach file metadata)
         if (!empty($relatedRecords)) {
@@ -1059,11 +1134,29 @@ class ReadTableTool extends AbstractRecordTool
         $records = $queryBuilder->executeQuery()->fetchAllAssociative();
         $linkedInWorkspaceOnly = $this->fetchChildrenLinkedInWorkspaceOnly($table, $foreignField, $parentUids, $foreignMatchFields, $records);
         $records = $this->applyWorkspaceOverlay($table, [...$records, ...$linkedInWorkspaceOnly]);
+        // The query matched the live pointer; the row the workspace sees decides: a child
+        // whose workspace version points at another parent is no child here.
+        $parentUidList = array_map('intval', $parentUids);
+        $records = array_values(array_filter(
+            $records,
+            static function (array $record) use ($foreignField, $parentUidList, $foreignMatchFields): bool {
+                if (!in_array((int)($record[$foreignField] ?? 0), $parentUidList, true)) {
+                    return false;
+                }
+                foreach ($foreignMatchFields as $matchField => $matchValue) {
+                    if ((string)($record[$matchField] ?? '') !== (string)$matchValue) {
+                        return false;
+                    }
+                }
+                return true;
+            }
+        ));
         // The query sorted by the live values. A workspace version may carry its own
         // (children reordered through their parent), and the rows linked in the workspace
         // only were not part of the query at all: order by the workspace values.
-        if ($foreignSortBy !== '') {
-            usort($records, static fn(array $a, array $b): int => [(int)($a[$foreignSortBy] ?? 0), (int)$a['uid']] <=> [(int)($b[$foreignSortBy] ?? 0), (int)$b['uid']]);
+        $sortBy = $foreignSortBy !== '' ? $foreignSortBy : (string)($GLOBALS['TCA'][$table]['ctrl']['sortby'] ?? '');
+        if ($sortBy !== '') {
+            usort($records, static fn(array $a, array $b): int => [(int)($a[$sortBy] ?? 0), (int)$a['uid']] <=> [(int)($b[$sortBy] ?? 0), (int)$b['uid']]);
         }
 
         // Embedded children get a curated default whitelist passed through the
@@ -1153,75 +1246,6 @@ class ReadTableTool extends AbstractRecordTool
         $eventDispatcher->dispatch(new BeforeRecordReadEvent($table, $liveQuery, 'select', BeforeRecordReadEvent::SOURCE_READ_INLINE));
 
         return $liveQuery->executeQuery()->fetchAllAssociative();
-    }
-
-    /**
-     * Get MM relation values for a field
-     *
-     * NOTE: This method provides basic MM relation support. It does NOT:
-     * - Apply foreign_table_where conditions
-     * - Resolve placeholders in foreign_table_where
-     * - Handle complex TYPO3 relation scenarios
-     *
-     * For complex scenarios, use TYPO3 Backend or DataHandler which handle
-     * these complexities properly.
-     *
-     * @param string $mmTable The MM table name
-     * @param string $localTable The local table name
-     * @param int $localUid The local record UID
-     * @param string $fieldName The field name (for documentation)
-     * @param array $fieldConfig The full field configuration from TCA
-     * @return array Array of related UIDs (not full records)
-     */
-    protected function getMmRelationValues(string $mmTable, string $localTable, int $localUid, string $fieldName, array $fieldConfig): array
-    {
-        $connectionPool = GeneralUtility::makeInstance(ConnectionPool::class);
-        $queryBuilder = $connectionPool->getQueryBuilderForTable($mmTable);
-
-        // Determine if this is an opposite/reverse relation
-        $isOppositeRelation = !empty($fieldConfig['MM_opposite_field']);
-
-        // Set column names based on relation direction
-        if ($isOppositeRelation) {
-            // For opposite relations (like categories), local record is in uid_foreign
-            $localColumn = 'uid_foreign';
-            $foreignColumn = 'uid_local';
-            $sortingColumn = 'sorting_foreign';
-        } else {
-            // For standard relations (like tags), local record is in uid_local
-            $localColumn = 'uid_local';
-            $foreignColumn = 'uid_foreign';
-            $sortingColumn = 'sorting';
-        }
-
-        // Basic constraints
-        $constraints = [
-            $queryBuilder->expr()->eq($localColumn, $queryBuilder->createNamedParameter($localUid, ParameterType::INTEGER))
-        ];
-
-        // Add match fields if specified (e.g., for shared MM tables like sys_category_record_mm)
-        $matchFields = $fieldConfig['MM_match_fields'] ?? [];
-        foreach ($matchFields as $field => $value) {
-            $constraints[] = $queryBuilder->expr()->eq(
-                $field,
-                $queryBuilder->createNamedParameter($value)
-            );
-        }
-
-        // Execute query
-        $result = $queryBuilder
-            ->select($foreignColumn)
-            ->from($mmTable)
-            ->where(...$constraints)
-            ->orderBy($sortingColumn, 'ASC')
-            ->executeQuery();
-
-        $values = [];
-        while ($row = $result->fetchAssociative()) {
-            $values[] = (int)$row[$foreignColumn];
-        }
-
-        return $values;
     }
 
     /**
