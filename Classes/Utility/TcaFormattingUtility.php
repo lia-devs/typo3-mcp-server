@@ -229,10 +229,13 @@ class TcaFormattingUtility
         
         // --- Common constraints (apply to all field types) ---
 
-        // Required: TYPO3 12+ explicit flag or legacy eval
-        if (!empty($config['required'])) {
-            $result .= " [Required]";
-        } elseif (isset($config['eval']) && strpos($config['eval'], 'required') !== false) {
+        // Required: explicit flag, legacy eval, or a minimum number of items (#186)
+        $minItems = (int)($config['minitems'] ?? 0);
+        $maxItems = (int)($config['maxitems'] ?? 0);
+        $isRequired = !empty($config['required'])
+            || $minItems > 0
+            || in_array('required', GeneralUtility::trimExplode(',', (string)($config['eval'] ?? ''), true), true);
+        if ($isRequired) {
             $result .= " [Required]";
         }
 
@@ -246,12 +249,14 @@ class TcaFormattingUtility
             $result .= " [Nullable]";
         }
 
-        // Min/max items (select, group, inline, file, folder, category)
-        if (isset($config['minitems']) && (int)$config['minitems'] > 0) {
-            $result .= " [minItems: " . (int)$config['minitems'] . "]";
-        }
-        if (isset($config['maxitems']) && (int)$config['maxitems'] > 0) {
-            $result .= " [maxItems: " . (int)$config['maxitems'] . "]";
+        // Min/max items, only where a field holds items
+        if (in_array($type, ['inline', 'file', 'group', 'select', 'category', 'folder'], true)) {
+            if ($minItems > 0) {
+                $result .= " [minitems: " . $minItems . "]";
+            }
+            if ($maxItems > 0) {
+                $result .= " [maxitems: " . $maxItems . "]";
+            }
         }
 
         // Range constraints (number, datetime)
